@@ -23,12 +23,12 @@ LOG = logging.getLogger(__name__)
 
 CONTENT_TYPE_HEADER = 'Content-type'
 ACCEPT_HEADER = 'Accept'
-AUTH_HEADER = 'Cookie'
+AUTH_HEADER = 'Authorization'
 DRIVER_HEADER = 'X-OpenStack-LBaaS'
 TENANT_HEADER = 'X-Tenant-ID'
 JSON_CONTENT_TYPE = 'application/json'
 DRIVER_HEADER_VALUE = 'netscaler-openstack-lbaas'
-NITRO_LOGIN_URI = 'nitro/v2/config/login'
+
 
 class NCCException(n_exc.NeutronException):
 
@@ -39,18 +39,17 @@ class NCCException(n_exc.NeutronException):
     RESPONSE_ERROR = 3
     UNKNOWN_ERROR = 4
 
-    def __init__(self, error, status=None):
+    def __init__(self, error):
         self.message = _("NCC Error %d") % error
         super(NCCException, self).__init__()
         self.error = error
-        self.status = status
 
 
 class NSClient(object):
 
     """Client to operate on REST resources of NetScaler Control Center."""
 
-    def __init__(self, service_uri, username, password, ncc_cleanup_mode):
+    def __init__(self, service_uri, username, password):
         if not service_uri:
             msg = _("No NetScaler Control Center URI specified. "
                     "Cannot connect.")
@@ -58,12 +57,10 @@ class NSClient(object):
             raise NCCException(NCCException.CONNECTION_ERROR)
         self.service_uri = service_uri.strip('/')
         self.auth = None
-        self.cleanup_mode = False
         if username and password:
-	        self.username = username
-	        self.password = password
-        if ncc_cleanup_mode.lower() == "true":
-            self.cleanup_mode = True
+            base64string = base64.encodestring("%s:%s" % (username, password))
+            base64string = base64string[:-1]
+            self.auth = 'Basic %s' % base64string
 
     def create_resource(self, tenant_id, resource_path, object_name,
                         object_data):
@@ -72,37 +69,6 @@ class NSClient(object):
                                         resource_path,
                                         object_name=object_name,
                                         object_data=object_data)
-    def is_login(self, resource_uri):
-        if 'login' in resource_uri.lower():
-            return True
-        else:
-            return False
-        
-    def login(self):
-        """Get session based login"""
-        login_obj={ "username":self.username, "password":self.password }
-        msg = _("NetScaler driver Login: %s") % repr(login_obj)
-        resp_status, result = self.create_resource("login", NITRO_LOGIN_URI,
-                                        "login", login_obj)
-        result_body = jsonutils.loads(result['body'])
-        
-        session_id = None
-        if result_body and "login" in result_body:
-            logins = result_body["login"]
-            if isinstance(logins, list):
-                login = logins[0]
-            else:
-                login = logins
-            if login and "sessionid" in login:
-                session_id = login["sessionid"]
-                
-        if session_id:
-            LOG.info("Response: %s" % result['body'])
-            LOG.info("Session_id = %s" %session_id)
-            """ Update sessin_id in auth"""
-            self.auth = "SessId=%s" % session_id
-        else:
-            raise NCCException(NCCException.RESPONSE_ERROR)
 
     def retrieve_resource(self, tenant_id, resource_path, parse_response=True):
         """Retrieve a resource of NetScaler Control Center."""
@@ -118,17 +84,11 @@ class NSClient(object):
 
     def remove_resource(self, tenant_id, resource_path, parse_response=True):
         """Remove a resource of NetScaler Control Center."""
-        if not self.cleanup_mode:
-            return self._resource_operation('DELETE', tenant_id, resource_path)
-        else:
-            return True
+        return self._resource_operation('DELETE', tenant_id, resource_path)
 
     def _resource_operation(self, method, tenant_id, resource_path,
                             object_name=None, object_data=None):
         resource_uri = "%s/%s" % (self.service_uri, resource_path)
-        if not self.auth and not self.is_login(resource_uri):
-            """ Creating a session for the first time"""
-            self.login()
         headers = self._setup_req_headers(tenant_id)
         request_body = None
         if object_data:
@@ -137,17 +97,11 @@ class NSClient(object):
             else:
                 obj_dict = {object_name: object_data}
                 request_body = jsonutils.dumps(obj_dict)
-        try:
-            response_status, resp_dict = self._execute_request(method,
+
+        response_status, resp_dict = self._execute_request(method,
                                                            resource_uri,
                                                            headers,
                                                            body=request_body)
-        except NCCException as e:
-            if (e.status and int(e.status) == requests.codes.NOT_FOUND 
-				and method == 'DELETE'):
-                return 200, {}
-            else:
-                raise
         return response_status, resp_dict
 
     def _is_valid_response(self, response_status):
@@ -211,33 +165,18 @@ class NSClient(object):
             LOG.exception(msg)
             raise NCCException(NCCException.UNKNOWN_ERROR)
         resp_dict = self._get_response_dict(response)
-        resp_body = resp_dict['body']
-        LOG.debug(_("Response: %s"), resp_body)
+        LOG.debug(_("Response: %s"), resp_dict['body'])
         response_status = resp_dict['status']
         if response_status == requests.codes.unauthorized:
             LOG.exception(_("Unable to login. Invalid credentials passed."
                           "for: %s"), self.service_uri)
-    	    if not self.is_login(resource_uri):
-                """Session expired, relogin and retry...."""
-    	        self.login()
-                """ Retry the operation"""
-                headers.update({AUTH_HEADER: self.auth})
-                self._execute_request(method, 
-                                      resource_uri, 
-                                      headers, 
-                                      body)
-            else:
-                raise NCCException(NCCException.RESPONSE_ERROR)
+            raise NCCException(NCCException.RESPONSE_ERROR)
         if not self._is_valid_response(response_status):
-            response_msg = resp_body
             msg = (_("Failed %(method)s operation on %(url)s "
-                   "status code: %(response_status)s "
-                   "message: %(response_msg)s") %
+                   "status code: %(response_status)s") %
                    {"method": method,
                     "url": resource_uri,
-                    "response_status": response_status,
-                    "response_msg": response_msg})
-            LOG.debug(msg)
-            raise NCCException(NCCException.RESPONSE_ERROR, response_status)
+                    "response_status": response_status})
+            LOG.exception(msg)
+            raise NCCException(NCCException.RESPONSE_ERROR)
         return response_status, resp_dict
-
