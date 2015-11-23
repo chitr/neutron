@@ -14,9 +14,10 @@
 
 import webob.exc
 
+from neutron.api import extensions
 from neutron.api.v2 import attributes as attr
 from neutron.common import exceptions as nexception
-from oslo.config import cfg
+from oslo_config import cfg
 
 allowed_address_pair_opts = [
     #TODO(limao): use quota framework when it support quota for attributes
@@ -48,9 +49,13 @@ class AllowedAddressPairExhausted(nexception.BadRequest):
 
 def _validate_allowed_address_pairs(address_pairs, valid_values=None):
     unique_check = {}
-    if len(address_pairs) > cfg.CONF.max_allowed_address_pair:
-        raise AllowedAddressPairExhausted(
-            quota=cfg.CONF.max_allowed_address_pair)
+    try:
+        if len(address_pairs) > cfg.CONF.max_allowed_address_pair:
+            raise AllowedAddressPairExhausted(
+                quota=cfg.CONF.max_allowed_address_pair)
+    except TypeError:
+        raise webob.exc.HTTPBadRequest(
+            _("Allowed address pairs must be a list."))
 
     for address_pair in address_pairs:
         # mac_address is optional, if not set we use the mac on the port
@@ -102,7 +107,7 @@ EXTENDED_ATTRIBUTES_2_0 = {
 }
 
 
-class Allowedaddresspairs(object):
+class Allowedaddresspairs(extensions.ExtensionDescriptor):
     """Extension class supporting allowed address pairs."""
 
     @classmethod
@@ -116,10 +121,6 @@ class Allowedaddresspairs(object):
     @classmethod
     def get_description(cls):
         return "Provides allowed address pairs"
-
-    @classmethod
-    def get_namespace(cls):
-        return "http://docs.openstack.org/ext/allowedaddresspairs/api/v2.0"
 
     @classmethod
     def get_updated(cls):

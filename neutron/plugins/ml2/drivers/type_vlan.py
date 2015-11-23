@@ -15,17 +15,15 @@
 
 import sys
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log
 from six import moves
 import sqlalchemy as sa
 
-from neutron.common import constants as q_const
 from neutron.common import exceptions as exc
-from neutron.common import utils
 from neutron.db import api as db_api
 from neutron.db import model_base
 from neutron.i18n import _LE, _LI, _LW
-from neutron.openstack.common import log
 from neutron.plugins.common import constants as p_const
 from neutron.plugins.common import utils as plugin_utils
 from neutron.plugins.ml2 import driver_api as api
@@ -61,6 +59,10 @@ class VlanAllocation(model_base.BASEV2):
     """
 
     __tablename__ = 'ml2_vlan_allocations'
+    __table_args__ = (
+        sa.Index('ix_ml2_vlan_allocations_physical_network_allocated',
+                 'physical_network', 'allocated'),
+        model_base.BASEV2.__table_args__,)
 
     physical_network = sa.Column(sa.String(64), nullable=False,
                                  primary_key=True)
@@ -69,7 +71,7 @@ class VlanAllocation(model_base.BASEV2):
     allocated = sa.Column(sa.Boolean, nullable=False)
 
 
-class VlanTypeDriver(helpers.TypeDriverHelper):
+class VlanTypeDriver(helpers.SegmentTypeDriver):
     """Manage state for VLAN networks with ML2.
 
     The VlanTypeDriver implements the 'vlan' network_type. VLAN
@@ -113,7 +115,7 @@ class VlanTypeDriver(helpers.TypeDriverHelper):
                 # this physical network
                 vlan_ids = set()
                 for vlan_min, vlan_max in vlan_ranges:
-                    vlan_ids |= set(moves.xrange(vlan_min, vlan_max + 1))
+                    vlan_ids |= set(moves.range(vlan_min, vlan_max + 1))
 
                 # remove from table unallocated vlans not currently
                 # allocatable
@@ -144,7 +146,7 @@ class VlanTypeDriver(helpers.TypeDriverHelper):
 
             # remove from table unallocated vlans for any unconfigured
             # physical networks
-            for allocs in allocations.itervalues():
+            for allocs in allocations.values():
                 for alloc in allocs:
                     if not alloc.allocated:
                         LOG.debug("Removing vlan %(vlan_id)s on physical "
@@ -173,11 +175,11 @@ class VlanTypeDriver(helpers.TypeDriverHelper):
                          " for VLAN provider network") % physical_network)
                 raise exc.InvalidInput(error_message=msg)
             if segmentation_id:
-                if not utils.is_valid_vlan_tag(segmentation_id):
+                if not plugin_utils.is_valid_vlan_tag(segmentation_id):
                     msg = (_("segmentation_id out of range (%(min)s through "
                              "%(max)s)") %
-                           {'min': q_const.MIN_VLAN_TAG,
-                            'max': q_const.MAX_VLAN_TAG})
+                           {'min': p_const.MIN_VLAN_TAG,
+                            'max': p_const.MAX_VLAN_TAG})
                     raise exc.InvalidInput(error_message=msg)
         elif segmentation_id:
             msg = _("segmentation_id requires physical_network for VLAN "
@@ -213,7 +215,8 @@ class VlanTypeDriver(helpers.TypeDriverHelper):
 
         return {api.NETWORK_TYPE: p_const.TYPE_VLAN,
                 api.PHYSICAL_NETWORK: alloc.physical_network,
-                api.SEGMENTATION_ID: alloc.vlan_id}
+                api.SEGMENTATION_ID: alloc.vlan_id,
+                api.MTU: self.get_mtu(alloc.physical_network)}
 
     def allocate_tenant_segment(self, session):
         alloc = self.allocate_partially_specified_segment(session)
@@ -221,7 +224,8 @@ class VlanTypeDriver(helpers.TypeDriverHelper):
             return
         return {api.NETWORK_TYPE: p_const.TYPE_VLAN,
                 api.PHYSICAL_NETWORK: alloc.physical_network,
-                api.SEGMENTATION_ID: alloc.vlan_id}
+                api.SEGMENTATION_ID: alloc.vlan_id,
+                api.MTU: self.get_mtu(alloc.physical_network)}
 
     def release_segment(self, session, segment):
         physical_network = segment[api.PHYSICAL_NETWORK]
@@ -254,3 +258,12 @@ class VlanTypeDriver(helpers.TypeDriverHelper):
                             "network %(physical_network)s"),
                         {'vlan_id': vlan_id,
                          'physical_network': physical_network})
+
+    def get_mtu(self, physical_network):
+        seg_mtu = super(VlanTypeDriver, self).get_mtu()
+        mtu = []
+        if seg_mtu > 0:
+            mtu.append(seg_mtu)
+        if physical_network in self.physnet_mtus:
+            mtu.append(int(self.physnet_mtus[physical_network]))
+        return min(mtu) if mtu else 0

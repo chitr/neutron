@@ -19,6 +19,7 @@ PORT = 'port'
 SECURITY_GROUP = 'security_group'
 L2POPULATION = 'l2population'
 DVR = 'dvr'
+RESOURCES = 'resources'
 
 CREATE = 'create'
 DELETE = 'delete'
@@ -27,6 +28,7 @@ UPDATE = 'update'
 AGENT = 'q-agent-notifier'
 PLUGIN = 'q-plugin'
 L3PLUGIN = 'q-l3-plugin'
+REPORTS = 'q-reports-plugin'
 DHCP = 'q-dhcp-notifer'
 FIREWALL_PLUGIN = 'q-firewall-plugin'
 METERING_PLUGIN = 'q-metering-plugin'
@@ -36,6 +38,8 @@ L3_AGENT = 'l3_agent'
 DHCP_AGENT = 'dhcp_agent'
 METERING_AGENT = 'metering_agent'
 LOADBALANCER_AGENT = 'n-lbaas_agent'
+
+RESOURCE_TOPIC_PATTERN = "neutron-vo-%(resource_type)s-%(version)s"
 
 
 def get_topic_name(prefix, table, operation, host=None):

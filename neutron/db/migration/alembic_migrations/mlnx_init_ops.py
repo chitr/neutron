@@ -25,7 +25,8 @@ def upgrade():
         sa.Column('physical_network', sa.String(length=64), nullable=False),
         sa.Column('segmentation_id', sa.Integer(), autoincrement=False,
                   nullable=False),
-        sa.Column('allocated', sa.Boolean(), nullable=False),
+        sa.Column('allocated', sa.Boolean(), nullable=False,
+                  server_default=sa.sql.false()),
         sa.PrimaryKeyConstraint('physical_network', 'segmentation_id'))
 
     op.create_table(
@@ -45,9 +46,3 @@ def upgrade():
         sa.ForeignKeyConstraint(['port_id'], ['ports.id'],
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('port_id'))
-
-
-def downgrade():
-    op.drop_table('port_profile')
-    op.drop_table('mlnx_network_bindings')
-    op.drop_table('segmentation_id_allocation')

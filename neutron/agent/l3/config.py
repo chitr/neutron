@@ -14,11 +14,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_config import cfg
+
+from neutron.common import constants
 
 
 OPTS = [
-    cfg.StrOpt('agent_mode', default='legacy',
+    cfg.StrOpt('agent_mode', default=constants.L3_AGENT_MODE_LEGACY,
+               choices=(constants.L3_AGENT_MODE_DVR,
+                        constants.L3_AGENT_MODE_DVR_SNAT,
+                        constants.L3_AGENT_MODE_LEGACY),
                help=_("The working mode for the agent. Allowed modes are: "
                       "'legacy' - this preserves the existing behavior "
                       "where the L3 agent is deployed on a centralized "
@@ -32,42 +37,60 @@ OPTS = [
                       "running on a centralized node (or in single-host "
                       "deployments, e.g. devstack)")),
     cfg.StrOpt('external_network_bridge', default='br-ex',
+               deprecated_for_removal=True,
                help=_("Name of bridge used for external network "
-                      "traffic.")),
-    cfg.IntOpt('metadata_port',
-               default=9697,
-               help=_("TCP Port used by Neutron metadata namespace "
-                      "proxy.")),
+                      "traffic. This option is deprecated and will be removed "
+                      "in the M release.")),
+    cfg.PortOpt('metadata_port',
+                default=9697,
+                help=_("TCP Port used by Neutron metadata namespace proxy.")),
     cfg.IntOpt('send_arp_for_ha',
                default=3,
                help=_("Send this many gratuitous ARPs for HA setup, if "
                       "less than or equal to 0, the feature is disabled")),
     cfg.StrOpt('router_id', default='',
-               help=_("If namespaces is disabled, the l3 agent can only"
-                      " configure a router that has the matching router "
-                      "ID.")),
+               help=_("If non-empty, the l3 agent can only configure a router "
+                      "that has the matching router ID.")),
     cfg.BoolOpt('handle_internal_only_routers',
                 default=True,
                 help=_("Agent should implement routers with no gateway")),
     cfg.StrOpt('gateway_external_network_id', default='',
                help=_("UUID of external network for routers implemented "
                       "by the agents.")),
+    cfg.StrOpt('ipv6_gateway', default='',
+               help=_("With IPv6, the network used for the external gateway "
+                      "does not need to have an associated subnet, since the "
+                      "automatically assigned link-local address (LLA) can "
+                      "be used. However, an IPv6 gateway address is needed "
+                      "for use as the next-hop for the default route. "
+                      "If no IPv6 gateway address is configured here, "
+                      "(and only then) the neutron router will be configured "
+                      "to get its default route from router advertisements "
+                      "(RAs) from the upstream router; in which case the "
+                      "upstream router must also be configured to send "
+                      "these RAs. "
+                      "The ipv6_gateway, when configured, should be the LLA "
+                      "of the interface on the upstream router. If a "
+                      "next-hop using a global unique address (GUA) is "
+                      "desired, it needs to be done via a subnet allocated "
+                      "to the network and not through this parameter. ")),
+    cfg.StrOpt('prefix_delegation_driver',
+               default='dibbler',
+               help=_('Driver used for ipv6 prefix delegation. This needs to '
+                      'be an entry point defined in the '
+                      'neutron.agent.linux.pd_drivers namespace. See '
+                      'setup.cfg for entry points included with the neutron '
+                      'source.')),
     cfg.BoolOpt('enable_metadata_proxy', default=True,
                 help=_("Allow running metadata proxy.")),
-    cfg.BoolOpt('router_delete_namespaces', default=False,
-                help=_("Delete namespace after removing a router.")),
-    cfg.StrOpt('metadata_proxy_socket',
-               default='$state_path/metadata_proxy',
-               help=_('Location of Metadata Proxy UNIX domain '
-                      'socket')),
-    cfg.StrOpt('metadata_proxy_user',
-               default='',
-               help=_("User (uid or name) running metadata proxy after "
-                      "its initialization (if empty: L3 agent effective "
-                      "user)")),
-    cfg.StrOpt('metadata_proxy_group',
-               default='',
-               help=_("Group (gid or name) running metadata proxy after "
-                      "its initialization (if empty: L3 agent effective "
-                      "group)"))
+    cfg.StrOpt('metadata_access_mark',
+               default='0x1',
+               help=_('Iptables mangle mark used to mark metadata valid '
+                      'requests. This mark will be masked with 0xffff so '
+                      'that only the lower 16 bits will be used.')),
+    cfg.StrOpt('external_ingress_mark',
+               default='0x2',
+               help=_('Iptables mangle mark used to mark ingress from '
+                      'external network. This mark will be masked with '
+                      '0xffff so that only the lower 16 bits will be used.')),
 ]

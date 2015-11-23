@@ -18,26 +18,34 @@
 
 """Utilities and helper functions."""
 
+import collections
 import datetime
+import decimal
+import errno
 import functools
 import hashlib
-import logging as std_logging
 import multiprocessing
 import netaddr
 import os
 import random
 import signal
 import socket
+import sys
+import tempfile
 import uuid
 
+import debtcollector
 from eventlet.green import subprocess
-from oslo.config import cfg
-from oslo.utils import excutils
 from oslo_concurrency import lockutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import importutils
+import six
+from stevedore import driver
 
-from neutron.common import constants as q_const
-from neutron.openstack.common import log as logging
-
+from neutron.common import constants as n_const
+from neutron.i18n import _LE
 
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 LOG = logging.getLogger(__name__)
@@ -104,6 +112,7 @@ class cache_method_results(object):
         return functools.partial(self.__call__, obj)
 
 
+@debtcollector.removals.remove(message="This will removed in the N cycle.")
 def read_cached_file(filename, cache_info, reload_func=None):
     """Read from a file if it has been modified.
 
@@ -125,6 +134,7 @@ def read_cached_file(filename, cache_info, reload_func=None):
     return cache_info['data']
 
 
+@debtcollector.removals.remove(message="This will removed in the N cycle.")
 def find_config_file(options, config_file):
     """Return the first config file found.
 
@@ -172,6 +182,16 @@ def find_config_file(options, config_file):
             return cfg_file
 
 
+def ensure_dir(dir_path):
+    """Ensure a directory with 755 permissions mode."""
+    try:
+        os.makedirs(dir_path, 0o755)
+    except OSError as e:
+        # If the directory already existed, don't raise the error.
+        if e.errno != errno.EEXIST:
+            raise
+
+
 def _subprocess_setup():
     # Python installs a SIGPIPE handler by default. This is usually not what
     # non-Python subprocesses expect.
@@ -179,10 +199,11 @@ def _subprocess_setup():
 
 
 def subprocess_popen(args, stdin=None, stdout=None, stderr=None, shell=False,
-                     env=None):
+                     env=None, preexec_fn=_subprocess_setup, close_fds=True):
+
     return subprocess.Popen(args, shell=shell, stdin=stdin, stdout=stdout,
-                            stderr=stderr, preexec_fn=_subprocess_setup,
-                            close_fds=True, env=env)
+                            stderr=stderr, preexec_fn=preexec_fn,
+                            close_fds=close_fds, env=env)
 
 
 def parse_mappings(mapping_list, unique_values=True):
@@ -209,7 +230,7 @@ def parse_mappings(mapping_list, unique_values=True):
         if key in mappings:
             raise ValueError(_("Key %(key)s in mapping: '%(mapping)s' not "
                                "unique") % {'key': key, 'mapping': mapping})
-        if unique_values and value in mappings.itervalues():
+        if unique_values and value in mappings.values():
             raise ValueError(_("Value %(value)s in mapping: '%(mapping)s' "
                                "not unique") % {'value': value,
                                                 'mapping': mapping})
@@ -219,6 +240,10 @@ def parse_mappings(mapping_list, unique_values=True):
 
 def get_hostname():
     return socket.gethostname()
+
+
+def get_first_host_ip(net, ip_version):
+    return str(netaddr.IPAddress(net.first + 1, ip_version))
 
 
 def compare_elements(a, b):
@@ -233,9 +258,16 @@ def compare_elements(a, b):
     return set(a) == set(b)
 
 
+def safe_sort_key(value):
+    """Return value hash or build one for dictionaries."""
+    if isinstance(value, collections.Mapping):
+        return sorted(value.items())
+    return value
+
+
 def dict2str(dic):
     return ','.join("%s=%s" % (key, val)
-                    for key, val in sorted(dic.iteritems()))
+                    for key, val in sorted(six.iteritems(dic)))
 
 
 def str2dict(string):
@@ -247,7 +279,7 @@ def str2dict(string):
 
 
 def dict2tuple(d):
-    items = d.items()
+    items = list(d.items())
     items.sort()
     return tuple(items)
 
@@ -266,19 +298,7 @@ def is_extension_supported(plugin, ext_alias):
 
 
 def log_opt_values(log):
-    cfg.CONF.log_opt_values(log, std_logging.DEBUG)
-
-
-def is_valid_vlan_tag(vlan):
-    return q_const.MIN_VLAN_TAG <= vlan <= q_const.MAX_VLAN_TAG
-
-
-def is_valid_gre_id(gre_id):
-    return q_const.MIN_GRE_ID <= gre_id <= q_const.MAX_GRE_ID
-
-
-def is_valid_vxlan_vni(vni):
-    return q_const.MIN_VXLAN_VNI <= vni <= q_const.MAX_VXLAN_VNI
+    cfg.CONF.log_opt_values(log, logging.DEBUG)
 
 
 def get_random_mac(base_mac):
@@ -299,14 +319,15 @@ def get_random_string(length):
     rndstr = ""
     random.seed(datetime.datetime.now().microsecond)
     while len(rndstr) < length:
-        rndstr += hashlib.sha224(str(random.random())).hexdigest()
+        base_str = str(random.random()).encode('utf-8')
+        rndstr += hashlib.sha224(base_str).hexdigest()
 
     return rndstr[0:length]
 
 
 def get_dhcp_agent_device_id(network_id, host):
     # Split host so as to always use only the hostname and
-    # not the domain name. This will guarantee consistentcy
+    # not the domain name. This will guarantee consistency
     # whether a local hostname or an fqdn is passed in.
     local_hostname = host.split('.')[0]
     host_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, str(local_hostname))
@@ -354,12 +375,14 @@ def is_dvr_serviced(device_owner):
     if they are required for DVR or any service directly or
     indirectly associated with DVR.
     """
-    dvr_serviced_device_owners = (q_const.DEVICE_OWNER_LOADBALANCER,
-                                  q_const.DEVICE_OWNER_DHCP)
-    return (device_owner.startswith('compute:') or
+    dvr_serviced_device_owners = (n_const.DEVICE_OWNER_LOADBALANCER,
+                                  n_const.DEVICE_OWNER_LOADBALANCERV2,
+                                  n_const.DEVICE_OWNER_DHCP)
+    return (device_owner.startswith(n_const.DEVICE_OWNER_COMPUTE_PREFIX) or
             device_owner in dvr_serviced_device_owners)
 
 
+@debtcollector.removals.remove(message="This will removed in the N cycle.")
 def get_keystone_url(conf):
     if conf.auth_uri:
         auth_uri = conf.auth_uri.rstrip('/')
@@ -386,6 +409,15 @@ def ip_to_cidr(ip, prefix=None):
     return str(net)
 
 
+def fixed_ip_cidrs(fixed_ips):
+    """Create a list of a port's fixed IPs in cidr notation.
+
+    :param fixed_ips: A neutron port's fixed_ips dictionary
+    """
+    return [ip_to_cidr(fixed_ip['ip_address'], fixed_ip.get('prefixlen'))
+            for fixed_ip in fixed_ips]
+
+
 def is_cidr_host(cidr):
     """Determines if the cidr passed in represents a single host network
 
@@ -398,5 +430,97 @@ def is_cidr_host(cidr):
         raise ValueError("cidr doesn't contain a '/'")
     net = netaddr.IPNetwork(cidr)
     if net.version == 4:
-        return net.prefixlen == q_const.IPv4_BITS
-    return net.prefixlen == q_const.IPv6_BITS
+        return net.prefixlen == n_const.IPv4_BITS
+    return net.prefixlen == n_const.IPv6_BITS
+
+
+def ip_version_from_int(ip_version_int):
+    if ip_version_int == 4:
+        return n_const.IPv4
+    if ip_version_int == 6:
+        return n_const.IPv6
+    raise ValueError(_('Illegal IP version number'))
+
+
+def is_port_trusted(port):
+    """Used to determine if port can be trusted not to attack network.
+
+    Trust is currently based on the device_owner field starting with 'network:'
+    since we restrict who can use that in the default policy.json file.
+    """
+    return port['device_owner'].startswith(n_const.DEVICE_OWNER_NETWORK_PREFIX)
+
+
+class DelayedStringRenderer(object):
+    """Takes a callable and its args and calls when __str__ is called
+
+    Useful for when an argument to a logging statement is expensive to
+    create. This will prevent the callable from being called if it's
+    never converted to a string.
+    """
+
+    def __init__(self, function, *args, **kwargs):
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs
+
+    def __str__(self):
+        return str(self.function(*self.args, **self.kwargs))
+
+
+def camelize(s):
+    return ''.join(s.replace('_', ' ').title().split())
+
+
+def round_val(val):
+    # we rely on decimal module since it behaves consistently across Python
+    # versions (2.x vs. 3.x)
+    return int(decimal.Decimal(val).quantize(decimal.Decimal('1'),
+                                             rounding=decimal.ROUND_HALF_UP))
+
+
+def replace_file(file_name, data, file_mode=0o644):
+    """Replaces the contents of file_name with data in a safe manner.
+
+    First write to a temp file and then rename. Since POSIX renames are
+    atomic, the file is unlikely to be corrupted by competing writes.
+
+    We create the tempfile on the same device to ensure that it can be renamed.
+    """
+
+    base_dir = os.path.dirname(os.path.abspath(file_name))
+    with tempfile.NamedTemporaryFile('w+',
+                                     dir=base_dir,
+                                     delete=False) as tmp_file:
+        tmp_file.write(data)
+    os.chmod(tmp_file.name, file_mode)
+    os.rename(tmp_file.name, file_name)
+
+
+def load_class_by_alias_or_classname(namespace, name):
+    """Load class using stevedore alias or the class name
+    :param namespace: namespace where the alias is defined
+    :param name: alias or class name of the class to be loaded
+    :returns class if calls can be loaded
+    :raises ImportError if class cannot be loaded
+    """
+
+    if not name:
+        LOG.error(_LE("Alias or class name is not set"))
+        raise ImportError(_("Class not found."))
+    try:
+        # Try to resolve class by alias
+        mgr = driver.DriverManager(namespace, name)
+        class_to_load = mgr.driver
+    except RuntimeError:
+        e1_info = sys.exc_info()
+        # Fallback to class name
+        try:
+            class_to_load = importutils.import_class(name)
+        except (ImportError, ValueError):
+            LOG.error(_LE("Error loading class by alias"),
+                      exc_info=e1_info)
+            LOG.error(_LE("Error loading class by class name"),
+                      exc_info=True)
+            raise ImportError(_("Class not found."))
+    return class_to_load

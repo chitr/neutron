@@ -39,6 +39,22 @@ The `Neutron Development wiki`_ is also a good resource for new contributors.
 
 Enjoy!
 
+Neutron Policies
+================
+
+.. toctree::
+   :maxdepth: 1
+
+   policies/index
+
+Neutron Stadium
+===============
+
+.. toctree::
+   :maxdepth: 1
+
+   stadium/index
+
 Developer Docs
 ==============
 
@@ -46,6 +62,17 @@ Developer Docs
    :maxdepth: 1
 
    devref/index
+
+Dashboards
+==========
+
+There is a collection of dashboards to help developers and reviewers
+located here.
+
+.. toctree::
+   :maxdepth: 2
+
+   dashboards/index
 
 API Extensions
 ==============

@@ -15,6 +15,7 @@
 
 import abc
 
+from oslo_log import log as logging
 import webob.exc
 
 from neutron.api import extensions
@@ -26,7 +27,6 @@ from neutron.common import rpc as n_rpc
 from neutron.extensions import agent
 from neutron.i18n import _LE
 from neutron import manager
-from neutron.openstack.common import log as logging
 from neutron.plugins.common import constants as service_constants
 from neutron import policy
 from neutron import wsgi
@@ -96,8 +96,7 @@ class L3AgentsHostingRouterController(wsgi.Controller):
         return plugin
 
     def index(self, request, **kwargs):
-        plugin = manager.NeutronManager.get_service_plugins().get(
-            service_constants.L3_ROUTER_NAT)
+        plugin = self.get_plugin()
         policy.enforce(request.context,
                        "get_%s" % L3_AGENTS,
                        {})
@@ -120,10 +119,6 @@ class L3agentscheduler(extensions.ExtensionDescriptor):
     @classmethod
     def get_description(cls):
         return "Schedule routers among l3 agents"
-
-    @classmethod
-    def get_namespace(cls):
-        return "http://docs.openstack.org/ext/l3_agent_scheduler/api/v1.0"
 
     @classmethod
     def get_updated(cls):
@@ -159,23 +154,18 @@ class InvalidL3Agent(agent.AgentNotFound):
 
 
 class RouterHostedByL3Agent(exceptions.Conflict):
-    message = _("The router %(router_id)s has been already hosted"
-                " by the L3 Agent %(agent_id)s.")
+    message = _("The router %(router_id)s has been already hosted "
+                "by the L3 Agent %(agent_id)s.")
 
 
 class RouterSchedulingFailed(exceptions.Conflict):
-    message = _("Failed scheduling router %(router_id)s to"
-                " the L3 Agent %(agent_id)s.")
+    message = _("Failed scheduling router %(router_id)s to "
+                "the L3 Agent %(agent_id)s.")
 
 
 class RouterReschedulingFailed(exceptions.Conflict):
     message = _("Failed rescheduling router %(router_id)s: "
                 "no eligible l3 agent found.")
-
-
-class RouterNotHostedByL3Agent(exceptions.Conflict):
-    message = _("The router %(router_id)s is not hosted"
-                " by L3 agent %(agent_id)s.")
 
 
 class RouterL3AgentMismatch(exceptions.Conflict):

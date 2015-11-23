@@ -13,7 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import copy
 import os.path
 
 from neutron import context
@@ -23,6 +22,7 @@ from neutron.api import extensions
 from neutron.api.v2 import attributes
 
 from neutron.tests import base
+from neutron.tests import tools
 
 TEST_PATH = os.path.dirname(os.path.abspath(__file__))
 
@@ -40,8 +40,7 @@ class APIPolicyTestCase(base.BaseTestCase):
 
     def setUp(self):
         super(APIPolicyTestCase, self).setUp()
-
-        self.ATTRIBUTE_MAP_COPY = copy.copy(attributes.RESOURCE_ATTRIBUTE_MAP)
+        self.useFixture(tools.AttributeMapMemento())
         self.extension_path = os.path.abspath(os.path.join(
             TEST_PATH, "../../../extensions"))
         policy.reset()
@@ -72,10 +71,8 @@ class APIPolicyTestCase(base.BaseTestCase):
         tenant_context = context.Context('test_user', 'test_tenant_id', False)
         extension_manager.extend_resources(self.api_version,
                                            attributes.RESOURCE_ATTRIBUTE_MAP)
-        self.assertEqual(self._check_external_router_policy(admin_context),
-                         True)
-        self.assertEqual(self._check_external_router_policy(tenant_context),
-                         False)
+        self.assertTrue(self._check_external_router_policy(admin_context))
+        self.assertFalse(self._check_external_router_policy(tenant_context))
 
     def test_proper_load_order(self):
         """
@@ -88,13 +85,9 @@ class APIPolicyTestCase(base.BaseTestCase):
                                            attributes.RESOURCE_ATTRIBUTE_MAP)
         admin_context = context.get_admin_context()
         tenant_context = context.Context('test_user', 'test_tenant_id', False)
-        self.assertEqual(self._check_external_router_policy(admin_context),
-                         True)
-        self.assertEqual(self._check_external_router_policy(tenant_context),
-                         True)
+        self.assertTrue(self._check_external_router_policy(admin_context))
+        self.assertTrue(self._check_external_router_policy(tenant_context))
 
     def tearDown(self):
         policy.reset()
-        if self.ATTRIBUTE_MAP_COPY:
-            attributes.RESOURCE_ATTRIBUTE_MAP = self.ATTRIBUTE_MAP_COPY
         super(APIPolicyTestCase, self).tearDown()

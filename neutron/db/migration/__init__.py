@@ -15,10 +15,30 @@
 import contextlib
 import functools
 
+import alembic
 from alembic import context
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.engine import reflection
+
+# Neutron milestones for upgrade aliases
+LIBERTY = 'liberty'
+MITAKA = 'mitaka'
+
+NEUTRON_MILESTONES = [
+    # earlier milestones were not tagged
+    LIBERTY,
+    MITAKA,
+]
+
+CREATION_OPERATIONS = (sa.sql.ddl.CreateIndex,
+                       sa.sql.ddl.CreateTable,
+                       sa.sql.ddl.CreateColumn,
+                       )
+DROP_OPERATIONS = (sa.sql.ddl.DropConstraint,
+                   sa.sql.ddl.DropIndex,
+                   sa.sql.ddl.DropTable,
+                   alembic.ddl.base.DropColumn)
 
 
 def skip_if_offline(func):
@@ -129,7 +149,7 @@ def create_table_if_not_exist_psql(table_name, values):
 def remove_foreign_keys(table, foreign_keys):
     for fk in foreign_keys:
         op.drop_constraint(
-            name=fk['name'],
+            constraint_name=fk['name'],
             table_name=table,
             type_='foreignkey'
         )
@@ -138,9 +158,9 @@ def remove_foreign_keys(table, foreign_keys):
 def create_foreign_keys(table, foreign_keys):
     for fk in foreign_keys:
         op.create_foreign_key(
-            name=fk['name'],
-            source=table,
-            referent=fk['referred_table'],
+            constraint_name=fk['name'],
+            source_table=table,
+            referent_table=fk['referred_table'],
             local_cols=fk['constrained_columns'],
             remote_cols=fk['referred_columns'],
             ondelete='CASCADE'

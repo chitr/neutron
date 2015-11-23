@@ -15,7 +15,7 @@
 
 import abc
 
-from oslo.config import cfg
+from oslo_config import cfg
 
 from neutron.api import extensions
 from neutron.api.v2 import attributes as attr
@@ -30,7 +30,12 @@ class RouterNotFound(nexception.NotFound):
 
 
 class RouterInUse(nexception.InUse):
-    message = _("Router %(router_id)s still has ports")
+    message = _("Router %(router_id)s %(reason)s")
+
+    def __init__(self, **kwargs):
+        if 'reason' not in kwargs:
+            kwargs['reason'] = "still has ports"
+        super(RouterInUse, self).__init__(**kwargs)
 
 
 class RouterInterfaceNotFound(nexception.NotFound):
@@ -66,11 +71,6 @@ class FloatingIPPortAlreadyAssociated(nexception.InUse):
                 "has a floating IP on external network %(net_id)s.")
 
 
-class L3PortInUse(nexception.InUse):
-    message = _("Port %(port_id)s has owner %(device_owner)s and therefore"
-                " cannot be deleted directly via the port API.")
-
-
 class RouterExternalGatewayInUseByFloatingIp(nexception.InUse):
     message = _("Gateway cannot be updated for router %(router_id)s, since a "
                 "gateway to external network %(net_id)s is required by one or "
@@ -86,7 +86,7 @@ RESOURCE_ATTRIBUTE_MAP = {
                'is_visible': True,
                'primary_key': True},
         'name': {'allow_post': True, 'allow_put': True,
-                 'validate': {'type:string': None},
+                 'validate': {'type:string': attr.NAME_MAX_LEN},
                  'is_visible': True, 'default': ''},
         'admin_state_up': {'allow_post': True, 'allow_put': True,
                            'default': True,
@@ -96,7 +96,7 @@ RESOURCE_ATTRIBUTE_MAP = {
                    'is_visible': True},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': True,
-                      'validate': {'type:string': None},
+                      'validate': {'type:string': attr.TENANT_ID_MAX_LEN},
                       'is_visible': True},
         EXTERNAL_GW_INFO: {'allow_post': True, 'allow_put': True,
                            'is_visible': True, 'default': None,
@@ -124,6 +124,10 @@ RESOURCE_ATTRIBUTE_MAP = {
                                 'validate': {'type:ip_address_or_none': None},
                                 'is_visible': True, 'default': None,
                                 'enforce_policy': True},
+        'subnet_id': {'allow_post': True, 'allow_put': False,
+                      'validate': {'type:uuid_or_none': None},
+                      'is_visible': False,  # Use False for input only attr
+                      'default': None},
         'floating_network_id': {'allow_post': True, 'allow_put': False,
                                 'validate': {'type:uuid': None},
                                 'is_visible': True},
@@ -139,7 +143,7 @@ RESOURCE_ATTRIBUTE_MAP = {
                              'is_visible': True, 'default': None},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': True,
-                      'validate': {'type:string': None},
+                      'validate': {'type:string': attr.TENANT_ID_MAX_LEN},
                       'is_visible': True},
         'status': {'allow_post': False, 'allow_put': False,
                    'is_visible': True},
@@ -174,10 +178,6 @@ class L3(extensions.ExtensionDescriptor):
         return ("Router abstraction for basic L3 forwarding"
                 " between L2 Neutron networks and access to external"
                 " networks via a NAT gateway.")
-
-    @classmethod
-    def get_namespace(cls):
-        return "http://docs.openstack.org/ext/neutron/router/api/v1.0"
 
     @classmethod
     def get_updated(cls):

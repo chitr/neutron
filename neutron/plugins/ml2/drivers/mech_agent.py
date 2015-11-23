@@ -16,9 +16,10 @@
 import abc
 import six
 
+from oslo_log import log
+
 from neutron.extensions import portbindings
 from neutron.i18n import _LW
-from neutron.openstack.common import log
 from neutron.plugins.common import constants as p_constants
 from neutron.plugins.ml2 import driver_api as api
 
@@ -66,7 +67,7 @@ class AgentMechanismDriverBase(api.MechanismDriver):
         for agent in context.host_agents(self.agent_type):
             LOG.debug("Checking agent: %s", agent)
             if agent['alive']:
-                for segment in context.network.network_segments:
+                for segment in context.segments_to_bind:
                     if self.try_to_bind_segment_for_agent(context, segment,
                                                           agent):
                         LOG.debug("Bound using segment: %s", segment)

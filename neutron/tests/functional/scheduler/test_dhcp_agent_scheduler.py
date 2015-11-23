@@ -21,17 +21,16 @@ from neutron.db import agents_db
 from neutron.db import agentschedulers_db
 from neutron.db import common_db_mixin
 from neutron.scheduler import dhcp_agent_scheduler
-from neutron.tests.unit import test_dhcp_scheduler as test_dhcp_sch
+from neutron.tests.unit.scheduler import (test_dhcp_agent_scheduler as
+                                          test_dhcp_sch)
+from operator import attrgetter
 
 # Required to generate tests from scenarios. Not compatible with nose.
 load_tests = testscenarios.load_tests_apply_scenarios
 
 
-class TestScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
-                          agentschedulers_db.DhcpAgentSchedulerDbMixin,
-                          agents_db.AgentDbMixin,
-                          common_db_mixin.CommonDbMixin):
-    """Test various scenarios for ChanceScheduler.schedule.
+class BaseTestScheduleNetwork(object):
+    """Base class which defines scenarios for schedulers.
 
         agent_count
             Number of dhcp agents (also number of hosts).
@@ -96,6 +95,14 @@ class TestScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
               expected_scheduled_agent_count=1)),
     ]
 
+
+class TestChanceScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
+                                agentschedulers_db.DhcpAgentSchedulerDbMixin,
+                                agents_db.AgentDbMixin,
+                                common_db_mixin.CommonDbMixin,
+                                BaseTestScheduleNetwork):
+    """Test various scenarios for ChanceScheduler.schedule."""
+
     def test_schedule_network(self):
         self.config(dhcp_agents_per_network=self.max_agents_per_network)
         scheduler = dhcp_agent_scheduler.ChanceScheduler()
@@ -111,9 +118,8 @@ class TestScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
         if self.scheduled_agent_count:
             # schedule the network
             schedule_agents = active_agents[:self.scheduled_agent_count]
-            scheduler._schedule_bind_network(self.ctx, schedule_agents,
-                                             self.network_id)
-
+            scheduler.resource_filter.bind(self.ctx,
+                                           schedule_agents, self.network_id)
         actual_scheduled_agents = scheduler.schedule(self, self.ctx,
                                                      self.network)
         if self.expected_scheduled_agent_count:
@@ -125,7 +131,54 @@ class TestScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
                              len(actual_scheduled_agents),
                              len(hosted_agents['agents']))
         else:
-            self.assertIsNone(actual_scheduled_agents)
+            self.assertEqual([], actual_scheduled_agents)
+
+
+class TestWeightScheduleNetwork(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
+                                agentschedulers_db.DhcpAgentSchedulerDbMixin,
+                                agents_db.AgentDbMixin,
+                                common_db_mixin.CommonDbMixin,
+                                BaseTestScheduleNetwork):
+    """Test various scenarios for WeightScheduler.schedule."""
+
+    def test_weight_schedule_network(self):
+        self.config(dhcp_agents_per_network=self.max_agents_per_network)
+        scheduler = dhcp_agent_scheduler.WeightScheduler()
+
+        # create dhcp agents
+        hosts = ['host-%s' % i for i in range(self.agent_count)]
+        dhcp_agents = self._create_and_set_agents_down(
+            hosts, down_agent_count=self.down_agent_count)
+
+        active_agents = dhcp_agents[self.down_agent_count:]
+
+        unscheduled_active_agents = list(active_agents)
+        # schedule some agents before calling schedule
+        if self.scheduled_agent_count:
+            # schedule the network
+            schedule_agents = active_agents[:self.scheduled_agent_count]
+            scheduler.resource_filter.bind(self.ctx,
+                                           schedule_agents, self.network_id)
+            for agent in schedule_agents:
+                unscheduled_active_agents.remove(agent)
+        actual_scheduled_agents = scheduler.schedule(self, self.ctx,
+                                                     self.network)
+        if self.expected_scheduled_agent_count:
+            sorted_unscheduled_active_agents = sorted(
+                unscheduled_active_agents,
+                key=attrgetter('load'))[0:self.expected_scheduled_agent_count]
+            self.assertItemsEqual(
+                (agent['id'] for agent in actual_scheduled_agents),
+                (agent['id'] for agent in sorted_unscheduled_active_agents))
+            self.assertEqual(self.expected_scheduled_agent_count,
+                             len(actual_scheduled_agents))
+            hosted_agents = self.list_dhcp_agents_hosting_network(
+                self.ctx, self.network_id)
+            self.assertEqual(self.scheduled_agent_count +
+                             len(actual_scheduled_agents),
+                             len(hosted_agents['agents']))
+        else:
+            self.assertEqual([], actual_scheduled_agents)
 
 
 class TestAutoSchedule(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
@@ -323,9 +376,9 @@ class TestAutoSchedule(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
             agent_index = self._extract_index(agent)
             for net in networks:
                 net_index = self._extract_index(net)
-                scheduler._schedule_bind_network(self.ctx,
-                                                 [dhcp_agents[agent_index]],
-                                                 self._networks[net_index])
+                scheduler.resource_filter.bind(self.ctx,
+                                               [dhcp_agents[agent_index]],
+                                               self._networks[net_index])
 
         retval = scheduler.auto_schedule_networks(self, self.ctx,
                                                   hosts[host_index])
@@ -338,9 +391,7 @@ class TestAutoSchedule(test_dhcp_sch.TestDhcpSchedulerBaseTestCase,
                           for net in hosted_networks]
         expected_hosted_networks = self.expected_hosted_networks['agent-%s' %
                                                                  host_index]
-        for hosted_net_id in hosted_net_ids:
-            self.assertIn(hosted_net_id, expected_hosted_networks,
-                          message=msg + '[%s]' % hosted_net_id)
+        self.assertItemsEqual(hosted_net_ids, expected_hosted_networks, msg)
 
     def test_auto_schedule(self):
         for i in range(self.agent_count):

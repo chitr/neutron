@@ -21,7 +21,7 @@ from neutron.common import exceptions
 HA_INFO = 'ha'
 EXTENDED_ATTRIBUTES_2_0 = {
     'routers': {
-        HA_INFO: {'allow_post': True, 'allow_put': False,
+        HA_INFO: {'allow_post': True, 'allow_put': True,
                   'default': attributes.ATTR_NOT_SPECIFIED, 'is_visible': True,
                   'enforce_policy': True,
                   'convert_to': attributes.convert_to_boolean_if_not_none}
@@ -29,8 +29,8 @@ EXTENDED_ATTRIBUTES_2_0 = {
 }
 
 
-class DistributedHARouterNotSupported(NotImplementedError):
-    message = _("Currenly distributed HA routers are "
+class DistributedHARouterNotSupported(exceptions.BadRequest):
+    message = _("Currently distributed HA routers are "
                 "not supported.")
 
 
@@ -81,10 +81,6 @@ class L3_ext_ha_mode(extensions.ExtensionDescriptor):
     @classmethod
     def get_description(cls):
         return "Add HA capability to routers."
-
-    @classmethod
-    def get_namespace(cls):
-        return ""
 
     @classmethod
     def get_updated(cls):

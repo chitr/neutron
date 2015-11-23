@@ -28,7 +28,7 @@ Supported configuration options:
 # https://etherpad.openstack.org/p/kilo-neutron-library-proposals for
 # the discussion leading to this deprecation.
 #
-# We recommend helping with the new neutron.cache library being created
+# We recommend helping with the new oslo.cache library being created
 # as a wrapper for dogpile.
 #
 ########################################################################
@@ -39,13 +39,13 @@ from stevedore import driver
 
 
 def _get_oslo_configs():
-    """Returns the oslo.config options to register."""
+    """Returns the oslo config options to register."""
     # NOTE(flaper87): Oslo config should be
     # optional. Instead of doing try / except
     # at the top of this file, lets import cfg
     # here and assume that the caller of this
     # function already took care of this dependency.
-    from oslo.config import cfg
+    from oslo_config import cfg
 
     return [
         cfg.StrOpt('cache_url', default='memory://',

@@ -14,7 +14,8 @@
 #    under the License.
 
 import netaddr
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 import sqlalchemy as sa
 from sqlalchemy import orm
 
@@ -25,7 +26,6 @@ from neutron.db import model_base
 from neutron.db import models_v2
 from neutron.extensions import extraroute
 from neutron.extensions import l3
-from neutron.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ class ExtraRoute_dbonly_mixin(l3_db.L3_NAT_dbonly_mixin):
         ips = []
         for port in ports:
             for ip in port['fixed_ips']:
-                cidrs.append(self._core_plugin._get_subnet(
+                cidrs.append(self._core_plugin.get_subnet(
                     context, ip['subnet_id'])['cidr'])
                 ips.append(ip['ip_address'])
         for route in routes:
@@ -157,28 +157,13 @@ class ExtraRoute_dbonly_mixin(l3_db.L3_NAT_dbonly_mixin):
             routes_dict[(route['destination'], route['nexthop'])] = route
         return routes, routes_dict
 
-    def get_router(self, context, id, fields=None):
-        with context.session.begin(subtransactions=True):
-            router = super(ExtraRoute_dbonly_mixin, self).get_router(
-                context, id, fields)
-            return router
-
-    def get_routers(self, context, filters=None, fields=None,
-                    sorts=None, limit=None, marker=None,
-                    page_reverse=False):
-        with context.session.begin(subtransactions=True):
-            routers = super(ExtraRoute_dbonly_mixin, self).get_routers(
-                context, filters, fields, sorts=sorts, limit=limit,
-                marker=marker, page_reverse=page_reverse)
-            return routers
-
     def _confirm_router_interface_not_in_use(self, context, router_id,
                                              subnet_id):
         super(ExtraRoute_dbonly_mixin,
             self)._confirm_router_interface_not_in_use(
             context, router_id, subnet_id)
-        subnet_db = self._core_plugin._get_subnet(context, subnet_id)
-        subnet_cidr = netaddr.IPNetwork(subnet_db['cidr'])
+        subnet = self._core_plugin.get_subnet(context, subnet_id)
+        subnet_cidr = netaddr.IPNetwork(subnet['cidr'])
         extra_routes = self._get_extra_routes_by_router_id(context, router_id)
         for route in extra_routes:
             if netaddr.all_matching_cidrs(route['nexthop'], [subnet_cidr]):

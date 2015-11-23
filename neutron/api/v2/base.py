@@ -13,12 +13,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import copy
-import netaddr
-import webob.exc
 
-from oslo.config import cfg
-from oslo.utils import excutils
+import netaddr
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_policy import policy as oslo_policy
+from oslo_utils import excutils
+import six
+import webob.exc
 
 from neutron.api import api_common
 from neutron.api.rpc.agentnotifiers import dhcp_rpc_agent_api
@@ -27,11 +31,11 @@ from neutron.api.v2 import resource as wsgi_resource
 from neutron.common import constants as const
 from neutron.common import exceptions
 from neutron.common import rpc as n_rpc
+from neutron.db import api as db_api
 from neutron.i18n import _LE, _LI
-from neutron.openstack.common import log as logging
-from neutron.openstack.common import policy as common_policy
 from neutron import policy
 from neutron import quota
+from neutron.quota import resource_registry
 
 
 LOG = logging.getLogger(__name__)
@@ -43,7 +47,7 @@ FAULT_MAP = {exceptions.NotFound: webob.exc.HTTPNotFound,
              exceptions.ServiceUnavailable: webob.exc.HTTPServiceUnavailable,
              exceptions.NotAuthorized: webob.exc.HTTPForbidden,
              netaddr.AddrFormatError: webob.exc.HTTPBadRequest,
-             common_policy.PolicyNotAuthorized: webob.exc.HTTPForbidden
+             oslo_policy.PolicyNotAuthorized: webob.exc.HTTPForbidden
              }
 
 
@@ -109,7 +113,7 @@ class Controller(object):
                                                          self._resource)
 
     def _get_primary_key(self, default_primary_key='id'):
-        for key, value in self._attr_info.iteritems():
+        for key, value in six.iteritems(self._attr_info):
             if value.get('primary_key', False):
                 return key
         return default_primary_key
@@ -144,7 +148,8 @@ class Controller(object):
                     context,
                     '%s:%s' % (self._plugin_handlers[self.SHOW], attr_name),
                     data,
-                    might_not_exist=True):
+                    might_not_exist=True,
+                    pluralized=self._collection):
                     # this attribute is visible, check next one
                     continue
             # if the code reaches this point then either the policy check
@@ -169,7 +174,7 @@ class Controller(object):
     def _filter_attributes(self, context, data, fields_to_strip=None):
         if not fields_to_strip:
             return data
-        return dict(item for item in data.iteritems()
+        return dict(item for item in six.iteritems(data)
                     if (item[0] not in fields_to_strip))
 
     def _do_field_list(self, original_fields):
@@ -183,24 +188,41 @@ class Controller(object):
 
     def __getattr__(self, name):
         if name in self._member_actions:
+            @db_api.retry_db_errors
             def _handle_action(request, id, **kwargs):
                 arg_list = [request.context, id]
                 # Ensure policy engine is initialized
                 policy.init()
                 # Fetch the resource and verify if the user can access it
                 try:
-                    resource = self._item(request, id, True)
-                except common_policy.PolicyNotAuthorized:
+                    parent_id = kwargs.get(self._parent_id_name)
+                    resource = self._item(request,
+                                          id,
+                                          do_authz=True,
+                                          field_list=None,
+                                          parent_id=parent_id)
+                except oslo_policy.PolicyNotAuthorized:
                     msg = _('The resource could not be found.')
                     raise webob.exc.HTTPNotFound(msg)
-                body = kwargs.pop('body', None)
+                body = copy.deepcopy(kwargs.pop('body', None))
                 # Explicit comparison with None to distinguish from {}
                 if body is not None:
                     arg_list.append(body)
                 # It is ok to raise a 403 because accessibility to the
                 # object was checked earlier in this method
-                policy.enforce(request.context, name, resource)
-                return getattr(self._plugin, name)(*arg_list, **kwargs)
+                policy.enforce(request.context,
+                               name,
+                               resource,
+                               pluralized=self._collection)
+                ret_value = getattr(self._plugin, name)(*arg_list, **kwargs)
+                # It is simply impossible to predict whether one of this
+                # actions alters resource usage. For instance a tenant port
+                # is created when a router interface is added. Therefore it is
+                # important to mark as dirty resources whose counters have
+                # been altered by this operation
+                resource_registry.set_resources_dirty(request.context)
+                return ret_value
+
             return _handle_action
         else:
             raise AttributeError()
@@ -254,7 +276,8 @@ class Controller(object):
                         if policy.check(request.context,
                                         self._plugin_handlers[self.SHOW],
                                         obj,
-                                        plugin=self._plugin)]
+                                        plugin=self._plugin,
+                                        pluralized=self._collection)]
         # Use the first element in the list for discriminating which attributes
         # should be filtered out because of authZ policies
         # fields_to_add contains a list of attributes added for request policy
@@ -272,6 +295,9 @@ class Controller(object):
         pagination_links = pagination_helper.get_links(obj_list)
         if pagination_links:
             collection[self._collection + "_links"] = pagination_links
+        # Synchronize usage trackers, if needed
+        resource_registry.resync_resource(
+            request.context, self._resource, request.context.tenant_id)
         return collection
 
     def _item(self, request, id, do_authz=False, field_list=None,
@@ -287,7 +313,10 @@ class Controller(object):
         # FIXME(salvatore-orlando): obj_getter might return references to
         # other resources. Must check authZ on them too.
         if do_authz:
-            policy.enforce(request.context, action, obj)
+            policy.enforce(request.context,
+                           action,
+                           obj,
+                           pluralized=self._collection)
         return obj
 
     def _send_dhcp_notification(self, context, data, methodname):
@@ -329,7 +358,7 @@ class Controller(object):
                                           field_list=field_list,
                                           parent_id=parent_id),
                                fields_to_strip=added_fields)}
-        except common_policy.PolicyNotAuthorized:
+        except oslo_policy.PolicyNotAuthorized:
             # To avoid giving away information, pretend that it
             # doesn't exist
             msg = _('The resource could not be found.')
@@ -372,13 +401,15 @@ class Controller(object):
                 # We need a way for ensuring that if it has been created,
                 # it is then deleted
 
+    @db_api.retry_db_errors
     def create(self, request, body=None, **kwargs):
         """Creates a new instance of the requested entity."""
         parent_id = kwargs.get(self._parent_id_name)
         self._notifier.info(request.context,
                             self._resource + '.create.start',
                             body)
-        body = Controller.prepare_request_body(request.context, body, True,
+        body = Controller.prepare_request_body(request.context,
+                                               copy.deepcopy(body), True,
                                                self._resource, self._attr_info,
                                                allow_bulk=self._allow_bulk)
         action = self._plugin_handlers[self.CREATE]
@@ -386,39 +417,51 @@ class Controller(object):
         if self._collection in body:
             # Have to account for bulk create
             items = body[self._collection]
-            deltas = {}
-            bulk = True
         else:
             items = [body]
-            bulk = False
         # Ensure policy engine is initialized
         policy.init()
+        # Store requested resource amounts grouping them by tenant
+        # This won't work with multiple resources. However because of the
+        # current structure of this controller there will hardly be more than
+        # one resource for which reservations are being made
+        request_deltas = collections.defaultdict(int)
         for item in items:
             self._validate_network_tenant_ownership(request,
                                                     item[self._resource])
             policy.enforce(request.context,
                            action,
-                           item[self._resource])
-            try:
-                tenant_id = item[self._resource]['tenant_id']
-                count = quota.QUOTAS.count(request.context, self._resource,
-                                           self._plugin, self._collection,
-                                           tenant_id)
-                if bulk:
-                    delta = deltas.get(tenant_id, 0) + 1
-                    deltas[tenant_id] = delta
-                else:
-                    delta = 1
-                kwargs = {self._resource: count + delta}
-            except exceptions.QuotaResourceUnknown as e:
+                           item[self._resource],
+                           pluralized=self._collection)
+            if 'tenant_id' not in item[self._resource]:
+                # no tenant_id - no quota check
+                continue
+            tenant_id = item[self._resource]['tenant_id']
+            request_deltas[tenant_id] += 1
+        # Quota enforcement
+        reservations = []
+        try:
+            for (tenant, delta) in request_deltas.items():
+                reservation = quota.QUOTAS.make_reservation(
+                    request.context,
+                    tenant,
+                    {self._resource: delta},
+                    self._plugin)
+                reservations.append(reservation)
+        except exceptions.QuotaResourceUnknown as e:
                 # We don't want to quota this resource
                 LOG.debug(e)
-            else:
-                quota.QUOTAS.limit_check(request.context,
-                                         item[self._resource]['tenant_id'],
-                                         **kwargs)
 
         def notify(create_result):
+            # Ensure usage trackers for all resources affected by this API
+            # operation are marked as dirty
+            with request.context.session.begin():
+                # Commit the reservation(s)
+                for reservation in reservations:
+                    quota.QUOTAS.commit_reservation(
+                        request.context, reservation.reservation_id)
+                resource_registry.set_resources_dirty(request.context)
+
             notifier_method = self._resource + '.create.end'
             self._notifier.info(request.context,
                                 notifier_method,
@@ -428,11 +471,35 @@ class Controller(object):
                                          notifier_method)
             return create_result
 
-        kwargs = {self._parent_id_name: parent_id} if parent_id else {}
+        def do_create(body, bulk=False, emulated=False):
+            kwargs = {self._parent_id_name: parent_id} if parent_id else {}
+            if bulk and not emulated:
+                obj_creator = getattr(self._plugin, "%s_bulk" % action)
+            else:
+                obj_creator = getattr(self._plugin, action)
+            try:
+                if emulated:
+                    return self._emulate_bulk_create(obj_creator, request,
+                                                     body, parent_id)
+                else:
+                    if self._collection in body:
+                        # This is weird but fixing it requires changes to the
+                        # plugin interface
+                        kwargs.update({self._collection: body})
+                    else:
+                        kwargs.update({self._resource: body})
+                    return obj_creator(request.context, **kwargs)
+            except Exception:
+                # In case of failure the plugin will always raise an
+                # exception. Cancel the reservation
+                with excutils.save_and_reraise_exception():
+                    for reservation in reservations:
+                        quota.QUOTAS.cancel_reservation(
+                            request.context, reservation.reservation_id)
+
         if self._collection in body and self._native_bulk:
             # plugin does atomic bulk create operations
-            obj_creator = getattr(self._plugin, "%s_bulk" % action)
-            objs = obj_creator(request.context, body, **kwargs)
+            objs = do_create(body, bulk=True)
             # Use first element of list to discriminate attributes which
             # should be removed because of authZ policies
             fields_to_strip = self._exclude_attributes_by_policy(
@@ -441,20 +508,18 @@ class Controller(object):
                 request.context, obj, fields_to_strip=fields_to_strip)
                 for obj in objs]})
         else:
-            obj_creator = getattr(self._plugin, action)
             if self._collection in body:
                 # Emulate atomic bulk behavior
-                objs = self._emulate_bulk_create(obj_creator, request,
-                                                 body, parent_id)
+                objs = do_create(body, bulk=True, emulated=True)
                 return notify({self._collection: objs})
             else:
-                kwargs.update({self._resource: body})
-                obj = obj_creator(request.context, **kwargs)
+                obj = do_create(body)
                 self._send_nova_notification(action, {},
                                              {self._resource: obj})
                 return notify({self._resource: self._view(request.context,
                                                           obj)})
 
+    @db_api.retry_db_errors
     def delete(self, request, id, **kwargs):
         """Deletes the specified entity."""
         self._notifier.info(request.context,
@@ -469,8 +534,9 @@ class Controller(object):
         try:
             policy.enforce(request.context,
                            action,
-                           obj)
-        except common_policy.PolicyNotAuthorized:
+                           obj,
+                           pluralized=self._collection)
+        except oslo_policy.PolicyNotAuthorized:
             # To avoid giving away information, pretend that it
             # doesn't exist
             msg = _('The resource could not be found.')
@@ -478,6 +544,9 @@ class Controller(object):
 
         obj_deleter = getattr(self._plugin, action)
         obj_deleter(request.context, id, **kwargs)
+        # A delete operation usually alters resource usage, so mark affected
+        # usage trackers as dirty
+        resource_registry.set_resources_dirty(request.context)
         notifier_method = self._resource + '.delete.end'
         self._notifier.info(request.context,
                             notifier_method,
@@ -488,6 +557,7 @@ class Controller(object):
                                      result,
                                      notifier_method)
 
+    @db_api.retry_db_errors
     def update(self, request, id, body=None, **kwargs):
         """Updates the specified entity's attributes."""
         parent_id = kwargs.get(self._parent_id_name)
@@ -507,7 +577,7 @@ class Controller(object):
         # Load object to check authz
         # but pass only attributes in the original body and required
         # by the policy engine to the policy 'brain'
-        field_list = [name for (name, value) in self._attr_info.iteritems()
+        field_list = [name for (name, value) in six.iteritems(self._attr_info)
                       if (value.get('required_by_policy') or
                           value.get('primary_key') or
                           'default' not in value)]
@@ -524,8 +594,9 @@ class Controller(object):
         try:
             policy.enforce(request.context,
                            action,
-                           orig_obj)
-        except common_policy.PolicyNotAuthorized:
+                           orig_obj,
+                           pluralized=self._collection)
+        except oslo_policy.PolicyNotAuthorized:
             with excutils.save_and_reraise_exception() as ctxt:
                 # If a tenant is modifying it's own object, it's safe to return
                 # a 403. Otherwise, pretend that it doesn't exist to avoid
@@ -540,6 +611,12 @@ class Controller(object):
         if parent_id:
             kwargs[self._parent_id_name] = parent_id
         obj = obj_updater(request.context, id, **kwargs)
+        # Usually an update operation does not alter resource usage, but as
+        # there might be side effects it might be worth checking for changes
+        # in resource usage here as well (e.g: a tenant port is created when a
+        # router interface is added)
+        resource_registry.set_resources_dirty(request.context)
+
         result = {self._resource: self._view(request.context, obj)}
         notifier_method = self._resource + '.update.end'
         self._notifier.info(request.context, notifier_method, result)
@@ -548,24 +625,6 @@ class Controller(object):
                                      notifier_method)
         self._send_nova_notification(action, orig_object_copy, result)
         return result
-
-    @staticmethod
-    def _populate_tenant_id(context, res_dict, is_create):
-
-        if (('tenant_id' in res_dict and
-             res_dict['tenant_id'] != context.tenant_id and
-             not context.is_admin)):
-            msg = _("Specifying 'tenant_id' other than authenticated "
-                    "tenant in request requires admin privileges")
-            raise webob.exc.HTTPBadRequest(msg)
-
-        if is_create and 'tenant_id' not in res_dict:
-            if context.tenant_id:
-                res_dict['tenant_id'] = context.tenant_id
-            else:
-                msg = _("Running without keystone AuthN requires "
-                        " that tenant_id is specified")
-                raise webob.exc.HTTPBadRequest(msg)
 
     @staticmethod
     def prepare_request_body(context, body, is_create, resource, attr_info,
@@ -584,74 +643,42 @@ class Controller(object):
             raise webob.exc.HTTPBadRequest(_("Resource body required"))
 
         LOG.debug("Request body: %(body)s", {'body': body})
-        if collection in body:
-            if not allow_bulk:
-                raise webob.exc.HTTPBadRequest(_("Bulk operation "
-                                                 "not supported"))
-            if not body[collection]:
-                raise webob.exc.HTTPBadRequest(_("Resources required"))
-            bulk_body = [
-                Controller.prepare_request_body(
-                    context, item if resource in item else {resource: item},
-                    is_create, resource, attr_info, allow_bulk
-                ) for item in body[collection]
-            ]
-            return {collection: bulk_body}
-
-        res_dict = body.get(resource)
+        try:
+            if collection in body:
+                if not allow_bulk:
+                    raise webob.exc.HTTPBadRequest(_("Bulk operation "
+                                                     "not supported"))
+                if not body[collection]:
+                    raise webob.exc.HTTPBadRequest(_("Resources required"))
+                bulk_body = [
+                    Controller.prepare_request_body(
+                        context, item if resource in item
+                        else {resource: item}, is_create, resource, attr_info,
+                        allow_bulk) for item in body[collection]
+                ]
+                return {collection: bulk_body}
+            res_dict = body.get(resource)
+        except (AttributeError, TypeError):
+            msg = _("Body contains invalid data")
+            raise webob.exc.HTTPBadRequest(msg)
         if res_dict is None:
             msg = _("Unable to find '%s' in request body") % resource
             raise webob.exc.HTTPBadRequest(msg)
 
-        Controller._populate_tenant_id(context, res_dict, is_create)
-        Controller._verify_attributes(res_dict, attr_info)
+        attributes.populate_tenant_id(context, res_dict, attr_info, is_create)
+        attributes.verify_attributes(res_dict, attr_info)
 
         if is_create:  # POST
-            for attr, attr_vals in attr_info.iteritems():
-                if attr_vals['allow_post']:
-                    if ('default' not in attr_vals and
-                        attr not in res_dict):
-                        msg = _("Failed to parse request. Required "
-                                "attribute '%s' not specified") % attr
-                        raise webob.exc.HTTPBadRequest(msg)
-                    res_dict[attr] = res_dict.get(attr,
-                                                  attr_vals.get('default'))
-                else:
-                    if attr in res_dict:
-                        msg = _("Attribute '%s' not allowed in POST") % attr
-                        raise webob.exc.HTTPBadRequest(msg)
+            attributes.fill_default_value(attr_info, res_dict,
+                                          webob.exc.HTTPBadRequest)
         else:  # PUT
-            for attr, attr_vals in attr_info.iteritems():
+            for attr, attr_vals in six.iteritems(attr_info):
                 if attr in res_dict and not attr_vals['allow_put']:
                     msg = _("Cannot update read-only attribute %s") % attr
                     raise webob.exc.HTTPBadRequest(msg)
 
-        for attr, attr_vals in attr_info.iteritems():
-            if (attr not in res_dict or
-                res_dict[attr] is attributes.ATTR_NOT_SPECIFIED):
-                continue
-            # Convert values if necessary
-            if 'convert_to' in attr_vals:
-                res_dict[attr] = attr_vals['convert_to'](res_dict[attr])
-            # Check that configured values are correct
-            if 'validate' not in attr_vals:
-                continue
-            for rule in attr_vals['validate']:
-                res = attributes.validators[rule](res_dict[attr],
-                                                  attr_vals['validate'][rule])
-                if res:
-                    msg_dict = dict(attr=attr, reason=res)
-                    msg = _("Invalid input for %(attr)s. "
-                            "Reason: %(reason)s.") % msg_dict
-                    raise webob.exc.HTTPBadRequest(msg)
+        attributes.convert_value(attr_info, res_dict, webob.exc.HTTPBadRequest)
         return body
-
-    @staticmethod
-    def _verify_attributes(res_dict, attr_info):
-        extra_keys = set(res_dict.keys()) - set(attr_info.keys())
-        if extra_keys:
-            msg = _("Unrecognized attribute(s) '%s'") % ', '.join(extra_keys)
-            raise webob.exc.HTTPBadRequest(msg)
 
     def _validate_network_tenant_ownership(self, request, resource_item):
         # TODO(salvatore-orlando): consider whether this check can be folded

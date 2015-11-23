@@ -16,20 +16,17 @@
 
 import functools
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging
+from oslo_utils import importutils
 
 from neutron.agent import firewall
-from neutron.common import rpc as n_rpc
-from neutron.common import topics
+from neutron.api.rpc.handlers import securitygroups_rpc
 from neutron.i18n import _LI, _LW
-from neutron.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
-# history
-#   1.1 Support Security Group RPC
-SG_RPC_VERSION = "1.1"
+
 
 security_group_opts = [
     cfg.StrOpt(
@@ -84,83 +81,15 @@ def disable_security_group_extension_by_config(aliases):
         _disable_extension('allowed-address-pairs', aliases)
 
 
-class SecurityGroupServerRpcApi(object):
-    """RPC client for security group methods in the plugin.
+class SecurityGroupAgentRpc(object):
+    """Enables SecurityGroup agent support in agent implementations."""
 
-    This class implements the client side of an rpc interface.  This interface
-    is used by agents to call security group related methods implemented on the
-    plugin side.  The other side of this interface can be found in
-    neutron.api.rpc.handlers.SecurityGroupServerRpcCallback.  For more
-    information about changing rpc interfaces, see
-    doc/source/devref/rpc_api.rst.
-    """
-    def __init__(self, topic):
-        target = messaging.Target(topic=topic, version='1.0')
-        self.client = n_rpc.get_client(target)
-
-    def security_group_rules_for_devices(self, context, devices):
-        LOG.debug("Get security group rules "
-                  "for devices via rpc %r", devices)
-        cctxt = self.client.prepare(version='1.1')
-        return cctxt.call(context, 'security_group_rules_for_devices',
-                          devices=devices)
-
-    def security_group_info_for_devices(self, context, devices):
-        LOG.debug("Get security group information for devices via rpc %r",
-                  devices)
-        cctxt = self.client.prepare(version='1.2')
-        return cctxt.call(context, 'security_group_info_for_devices',
-                          devices=devices)
-
-
-class SecurityGroupAgentRpcCallbackMixin(object):
-    """A mix-in that enable SecurityGroup agent
-    support in agent implementations.
-    """
-    #mix-in object should be have sg_agent
-    sg_agent = None
-
-    def _security_groups_agent_not_set(self):
-        LOG.warning(_LW("Security group agent binding currently not set. "
-                        "This should be set by the end of the init "
-                        "process."))
-
-    def security_groups_rule_updated(self, context, **kwargs):
-        """Callback for security group rule update.
-
-        :param security_groups: list of updated security_groups
-        """
-        security_groups = kwargs.get('security_groups', [])
-        LOG.debug("Security group rule updated on remote: %s",
-                  security_groups)
-        if not self.sg_agent:
-            return self._security_groups_agent_not_set()
-        self.sg_agent.security_groups_rule_updated(security_groups)
-
-    def security_groups_member_updated(self, context, **kwargs):
-        """Callback for security group member update.
-
-        :param security_groups: list of updated security_groups
-        """
-        security_groups = kwargs.get('security_groups', [])
-        LOG.debug("Security group member updated on remote: %s",
-                  security_groups)
-        if not self.sg_agent:
-            return self._security_groups_agent_not_set()
-        self.sg_agent.security_groups_member_updated(security_groups)
-
-    def security_groups_provider_updated(self, context, **kwargs):
-        """Callback for security group provider update."""
-        LOG.debug("Provider rule updated")
-        if not self.sg_agent:
-            return self._security_groups_agent_not_set()
-        self.sg_agent.security_groups_provider_updated()
-
-
-class SecurityGroupAgentRpcMixin(object):
-    """A mix-in that enable SecurityGroup agent
-    support in agent implementations.
-    """
+    def __init__(self, context, plugin_rpc, local_vlan_map=None,
+                 defer_refresh_firewall=False,):
+        self.context = context
+        self.plugin_rpc = plugin_rpc
+        self.init_firewall(defer_refresh_firewall)
+        self.local_vlan_map = local_vlan_map
 
     def init_firewall(self, defer_refresh_firewall=False):
         firewall_driver = cfg.CONF.SECURITYGROUP.firewall_driver
@@ -192,7 +121,7 @@ class SecurityGroupAgentRpcMixin(object):
         try:
             self.plugin_rpc.security_group_info_for_devices(
                 self.context, devices=[])
-        except messaging.UnsupportedVersion:
+        except oslo_messaging.UnsupportedVersion:
             LOG.warning(_LW('security_group_info_for_devices rpc call not '
                             'supported by the server, falling back to old '
                             'security_group_rules_for_devices which scales '
@@ -251,22 +180,25 @@ class SecurityGroupAgentRpcMixin(object):
                  "rule updated %r"), security_groups)
         self._security_group_updated(
             security_groups,
-            'security_groups')
+            'security_groups',
+            'sg_rule')
 
     def security_groups_member_updated(self, security_groups):
         LOG.info(_LI("Security group "
                  "member updated %r"), security_groups)
         self._security_group_updated(
             security_groups,
-            'security_group_source_groups')
+            'security_group_source_groups',
+            'sg_member')
 
-    def _security_group_updated(self, security_groups, attribute):
+    def _security_group_updated(self, security_groups, attribute, action_type):
         devices = []
         sec_grp_set = set(security_groups)
         for device in self.firewall.ports.values():
             if sec_grp_set & set(device.get(attribute, [])):
                 devices.append(device['device'])
         if devices:
+            self.firewall.security_group_updated(action_type, sec_grp_set)
             if self.defer_refresh_firewall:
                 LOG.debug("Adding %s devices to the list of devices "
                           "for which firewall needs to be refreshed",
@@ -275,15 +207,15 @@ class SecurityGroupAgentRpcMixin(object):
             else:
                 self.refresh_firewall(devices)
 
-    def security_groups_provider_updated(self):
+    def security_groups_provider_updated(self, devices_to_update):
         LOG.info(_LI("Provider rule updated"))
         if self.defer_refresh_firewall:
-            # NOTE(salv-orlando): A 'global refresh' might not be
-            # necessary if the subnet for which the provider rules
-            # were updated is known
-            self.global_refresh_firewall = True
+            if devices_to_update is None:
+                self.global_refresh_firewall = True
+            else:
+                self.devices_to_refilter |= set(devices_to_update)
         else:
-            self.refresh_firewall()
+            self.refresh_firewall(devices_to_update)
 
     def remove_devices_filter(self, device_ids):
         if not device_ids:
@@ -359,6 +291,8 @@ class SecurityGroupAgentRpcMixin(object):
             LOG.debug("Refreshing firewall for all filtered devices")
             self.refresh_firewall()
         else:
+            self.firewall.security_group_updated('sg_member', [],
+                                                 updated_devices)
             # If a device is both in new and updated devices
             # avoid reprocessing it
             updated_devices = ((updated_devices | devices_to_refilter) -
@@ -369,36 +303,16 @@ class SecurityGroupAgentRpcMixin(object):
                 self.refresh_firewall(updated_devices)
 
 
-class SecurityGroupAgentRpcApiMixin(object):
-
-    def _get_security_group_topic(self):
-        return topics.get_topic_name(self.topic,
-                                     topics.SECURITY_GROUP,
-                                     topics.UPDATE)
-
-    def security_groups_rule_updated(self, context, security_groups):
-        """Notify rule updated security groups."""
-        if not security_groups:
-            return
-        cctxt = self.client.prepare(version=SG_RPC_VERSION,
-                                    topic=self._get_security_group_topic(),
-                                    fanout=True)
-        cctxt.cast(context, 'security_groups_rule_updated',
-                   security_groups=security_groups)
-
-    def security_groups_member_updated(self, context, security_groups):
-        """Notify member updated security groups."""
-        if not security_groups:
-            return
-        cctxt = self.client.prepare(version=SG_RPC_VERSION,
-                                    topic=self._get_security_group_topic(),
-                                    fanout=True)
-        cctxt.cast(context, 'security_groups_member_updated',
-                   security_groups=security_groups)
-
-    def security_groups_provider_updated(self, context):
-        """Notify provider updated security groups."""
-        cctxt = self.client.prepare(version=SG_RPC_VERSION,
-                                    topic=self._get_security_group_topic(),
-                                    fanout=True)
-        cctxt.cast(context, 'security_groups_provider_updated')
+# TODO(armax): for bw compat with external dependencies; to be dropped in M.
+SG_RPC_VERSION = (
+    securitygroups_rpc.SecurityGroupAgentRpcApiMixin.SG_RPC_VERSION
+)
+SecurityGroupServerRpcApi = (
+    securitygroups_rpc.SecurityGroupServerRpcApi
+)
+SecurityGroupAgentRpcApiMixin = (
+    securitygroups_rpc.SecurityGroupAgentRpcApiMixin
+)
+SecurityGroupAgentRpcCallbackMixin = (
+    securitygroups_rpc.SecurityGroupAgentRpcCallbackMixin
+)

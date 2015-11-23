@@ -22,18 +22,20 @@ from neutron.db.metering import metering_rpc
 class MeteringPlugin(metering_db.MeteringDbMixin):
     """Implementation of the Neutron Metering Service Plugin."""
     supported_extension_aliases = ["metering"]
+    path_prefix = "/metering"
 
     def __init__(self):
         super(MeteringPlugin, self).__init__()
 
-        self.endpoints = [metering_rpc.MeteringRpcCallbacks(self)]
+        self.meter_rpc = metering_rpc_agent_api.MeteringAgentNotifyAPI()
+        self.start_rpc_listeners()
 
-        self.conn = n_rpc.create_connection(new=True)
+    def start_rpc_listeners(self):
+        self.endpoints = [metering_rpc.MeteringRpcCallbacks(self)]
+        self.conn = n_rpc.create_connection()
         self.conn.create_consumer(
             topics.METERING_PLUGIN, self.endpoints, fanout=False)
-        self.conn.consume_in_threads()
-
-        self.meter_rpc = metering_rpc_agent_api.MeteringAgentNotifyAPI()
+        return self.conn.consume_in_threads()
 
     def create_metering_label(self, context, metering_label):
         label = super(MeteringPlugin, self).create_metering_label(
@@ -57,8 +59,8 @@ class MeteringPlugin(metering_db.MeteringDbMixin):
         rule = super(MeteringPlugin, self).create_metering_label_rule(
             context, metering_label_rule)
 
-        data = self.get_sync_data_metering(context)
-        self.meter_rpc.update_metering_label_rules(context, data)
+        data = self.get_sync_data_for_rule(context, rule)
+        self.meter_rpc.add_metering_label_rule(context, data)
 
         return rule
 
@@ -66,7 +68,6 @@ class MeteringPlugin(metering_db.MeteringDbMixin):
         rule = super(MeteringPlugin, self).delete_metering_label_rule(
             context, rule_id)
 
-        data = self.get_sync_data_metering(context)
-        self.meter_rpc.update_metering_label_rules(context, data)
-
+        data = self.get_sync_data_for_rule(context, rule)
+        self.meter_rpc.remove_metering_label_rule(context, data)
         return rule

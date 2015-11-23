@@ -52,7 +52,8 @@ RESOURCE_ATTRIBUTE_MAP = {
                            'is_visible': True},
         'description': {'allow_post': False, 'allow_put': True,
                         'is_visible': True,
-                        'validate': {'type:string': None}},
+                        'validate': {
+                            'type:string_or_none': attr.DESCRIPTION_MAX_LEN}},
     },
 }
 
@@ -71,7 +72,7 @@ class MultipleAgentFoundByTypeHost(exceptions.Conflict):
                 "host=%(host)s found")
 
 
-class Agent(object):
+class Agent(extensions.ExtensionDescriptor):
     """Agent management extension."""
 
     @classmethod
@@ -85,10 +86,6 @@ class Agent(object):
     @classmethod
     def get_description(cls):
         return "The agent management extension."
-
-    @classmethod
-    def get_namespace(cls):
-        return "http://docs.openstack.org/ext/agent/api/v2.0"
 
     @classmethod
     def get_updated(cls):
@@ -110,6 +107,10 @@ class Agent(object):
                                           controller)
 
         return [ex]
+
+    def update_attributes_map(self, attributes):
+        super(Agent, self).update_attributes_map(
+            attributes, extension_attrs_map=RESOURCE_ATTRIBUTE_MAP)
 
     def get_extended_resources(self, version):
         if version == "2.0":

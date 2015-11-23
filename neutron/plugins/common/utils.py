@@ -16,15 +16,34 @@
 Common utilities and helper functions for Openstack Networking Plugins.
 """
 
+import webob.exc
+
+from neutron.api.v2 import attributes
 from neutron.common import exceptions as n_exc
-from neutron.common import utils
 from neutron.plugins.common import constants as p_const
+
+
+def is_valid_vlan_tag(vlan):
+    return p_const.MIN_VLAN_TAG <= vlan <= p_const.MAX_VLAN_TAG
+
+
+def is_valid_gre_id(gre_id):
+    return p_const.MIN_GRE_ID <= gre_id <= p_const.MAX_GRE_ID
+
+
+def is_valid_vxlan_vni(vni):
+    return p_const.MIN_VXLAN_VNI <= vni <= p_const.MAX_VXLAN_VNI
+
+
+def is_valid_geneve_vni(vni):
+    return p_const.MIN_GENEVE_VNI <= vni <= p_const.MAX_GENEVE_VNI
 
 
 def verify_tunnel_range(tunnel_range, tunnel_type):
     """Raise an exception for invalid tunnel range or malformed range."""
-    mappings = {p_const.TYPE_GRE: utils.is_valid_gre_id,
-                p_const.TYPE_VXLAN: utils.is_valid_vxlan_vni}
+    mappings = {p_const.TYPE_GRE: is_valid_gre_id,
+                p_const.TYPE_VXLAN: is_valid_vxlan_vni,
+                p_const.TYPE_GENEVE: is_valid_geneve_vni}
     if tunnel_type in mappings:
         for ident in tunnel_range:
             if not mappings[tunnel_type](ident):
@@ -42,7 +61,7 @@ def verify_tunnel_range(tunnel_range, tunnel_type):
 def verify_vlan_range(vlan_range):
     """Raise an exception for invalid tags or malformed range."""
     for vlan_tag in vlan_range:
-        if not utils.is_valid_vlan_tag(vlan_tag):
+        if not is_valid_vlan_tag(vlan_tag):
             raise n_exc.NetworkVlanRangeError(
                 vlan_range=vlan_range,
                 error=_("%s is not a valid VLAN tag") % vlan_tag)
@@ -85,3 +104,37 @@ def in_pending_status(status):
     return status in (p_const.PENDING_CREATE,
                       p_const.PENDING_UPDATE,
                       p_const.PENDING_DELETE)
+
+
+def _fixup_res_dict(context, attr_name, res_dict, check_allow_post=True):
+    attr_info = attributes.RESOURCE_ATTRIBUTE_MAP[attr_name]
+    try:
+        attributes.populate_tenant_id(context, res_dict, attr_info, True)
+        attributes.verify_attributes(res_dict, attr_info)
+    except webob.exc.HTTPBadRequest as e:
+        # convert webob exception into ValueError as these functions are
+        # for internal use. webob exception doesn't make sense.
+        raise ValueError(e.detail)
+    attributes.fill_default_value(attr_info, res_dict,
+                                  check_allow_post=check_allow_post)
+    attributes.convert_value(attr_info, res_dict)
+    return res_dict
+
+
+def create_network(core_plugin, context, net):
+    net_data = _fixup_res_dict(context, attributes.NETWORKS,
+                               net.get('network', {}))
+    return core_plugin.create_network(context, {'network': net_data})
+
+
+def create_subnet(core_plugin, context, subnet):
+    subnet_data = _fixup_res_dict(context, attributes.SUBNETS,
+                                  subnet.get('subnet', {}))
+    return core_plugin.create_subnet(context, {'subnet': subnet_data})
+
+
+def create_port(core_plugin, context, port, check_allow_post=True):
+    port_data = _fixup_res_dict(context, attributes.PORTS,
+                                port.get('port', {}),
+                                check_allow_post=check_allow_post)
+    return core_plugin.create_port(context, {'port': port_data})

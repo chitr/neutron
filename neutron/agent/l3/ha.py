@@ -14,22 +14,21 @@
 #    under the License.
 
 import os
-import signal
 
-import netaddr
-from oslo.config import cfg
+import eventlet
+from oslo_config import cfg
+from oslo_log import log as logging
+import webob
 
-from neutron.agent.linux import ip_lib
 from neutron.agent.linux import keepalived
-from neutron.agent.metadata import driver as metadata_driver
-from neutron.common import constants as l3_constants
-from neutron.i18n import _LE
-from neutron.openstack.common import log as logging
-from neutron.openstack.common import periodic_task
+from neutron.agent.linux import utils as agent_utils
+from neutron.common import utils as common_utils
+from neutron.i18n import _LI
+from neutron.notifiers import batch_notifier
 
 LOG = logging.getLogger(__name__)
 
-HA_DEV_PREFIX = 'ha-'
+KEEPALIVED_STATE_CHANGE_SERVER_BACKLOG = 4096
 
 OPTS = [
     cfg.StrOpt('ha_confs_path',
@@ -38,7 +37,8 @@ OPTS = [
                       'config files')),
     cfg.StrOpt('ha_vrrp_auth_type',
                default='PASS',
-               help=_('VRRP authentication type AH/PASS')),
+               choices=keepalived.VALID_AUTH_TYPES,
+               help=_('VRRP authentication type')),
     cfg.StrOpt('ha_vrrp_auth_password',
                help=_('VRRP authentication password'),
                secret=True),
@@ -48,194 +48,132 @@ OPTS = [
 ]
 
 
+class KeepalivedStateChangeHandler(object):
+    def __init__(self, agent):
+        self.agent = agent
+
+    @webob.dec.wsgify(RequestClass=webob.Request)
+    def __call__(self, req):
+        router_id = req.headers['X-Neutron-Router-Id']
+        state = req.headers['X-Neutron-State']
+        self.enqueue(router_id, state)
+
+    def enqueue(self, router_id, state):
+        LOG.debug('Handling notification for router '
+                  '%(router_id)s, state %(state)s', {'router_id': router_id,
+                                                     'state': state})
+        self.agent.enqueue_state_change(router_id, state)
+
+
+class L3AgentKeepalivedStateChangeServer(object):
+    def __init__(self, agent, conf):
+        self.agent = agent
+        self.conf = conf
+
+        agent_utils.ensure_directory_exists_without_file(
+            self.get_keepalived_state_change_socket_path(self.conf))
+
+    @classmethod
+    def get_keepalived_state_change_socket_path(cls, conf):
+        return os.path.join(conf.state_path, 'keepalived-state-change')
+
+    def run(self):
+        server = agent_utils.UnixDomainWSGIServer(
+            'neutron-keepalived-state-change')
+        server.start(KeepalivedStateChangeHandler(self.agent),
+                     self.get_keepalived_state_change_socket_path(self.conf),
+                     workers=0,
+                     backlog=KEEPALIVED_STATE_CHANGE_SERVER_BACKLOG)
+        server.wait()
+
+
 class AgentMixin(object):
     def __init__(self, host):
         self._init_ha_conf_path()
         super(AgentMixin, self).__init__(host)
+        self.state_change_notifier = batch_notifier.BatchNotifier(
+            self._calculate_batch_duration(), self.notify_server)
+        eventlet.spawn(self._start_keepalived_notifications_server)
+
+    def _start_keepalived_notifications_server(self):
+        state_change_server = (
+            L3AgentKeepalivedStateChangeServer(self, self.conf))
+        state_change_server.run()
+
+    def _calculate_batch_duration(self):
+        # Slave becomes the master after not hearing from it 3 times
+        detection_time = self.conf.ha_vrrp_advert_int * 3
+
+        # Keepalived takes a couple of seconds to configure the VIPs
+        configuration_time = 2
+
+        # Give it enough slack to batch all events due to the same failure
+        return (detection_time + configuration_time) * 2
+
+    def enqueue_state_change(self, router_id, state):
+        LOG.info(_LI('Router %(router_id)s transitioned to %(state)s'),
+                 {'router_id': router_id,
+                  'state': state})
+
+        try:
+            ri = self.router_info[router_id]
+        except KeyError:
+            LOG.info(_LI('Router %s is not managed by this agent. It was '
+                         'possibly deleted concurrently.'), router_id)
+            return
+
+        self._configure_ipv6_ra_on_ext_gw_port_if_necessary(ri, state)
+        if self.conf.enable_metadata_proxy:
+            self._update_metadata_proxy(ri, router_id, state)
+        self._update_radvd_daemon(ri, state)
+        self.state_change_notifier.queue_event((router_id, state))
+
+    def _configure_ipv6_ra_on_ext_gw_port_if_necessary(self, ri, state):
+        # If ipv6 is enabled on the platform, ipv6_gateway config flag is
+        # not set and external_network associated to the router does not
+        # include any IPv6 subnet, enable the gateway interface to accept
+        # Router Advts from upstream router for default route.
+        ex_gw_port_id = ri.ex_gw_port and ri.ex_gw_port['id']
+        if state == 'master' and ex_gw_port_id and ri.use_ipv6:
+            gateway_ips = ri._get_external_gw_ips(ri.ex_gw_port)
+            if not ri.is_v6_gateway_set(gateway_ips):
+                interface_name = ri.get_external_device_name(ex_gw_port_id)
+                if ri.router.get('distributed', False):
+                    namespace = ri.ha_namespace
+                else:
+                    namespace = ri.ns_name
+                ri.driver.configure_ipv6_ra(namespace, interface_name)
+
+    def _update_metadata_proxy(self, ri, router_id, state):
+        if state == 'master':
+            LOG.debug('Spawning metadata proxy for router %s', router_id)
+            self.metadata_driver.spawn_monitored_metadata_proxy(
+                self.process_monitor, ri.ns_name, self.conf.metadata_port,
+                self.conf, router_id=ri.router_id)
+        else:
+            LOG.debug('Closing metadata proxy for router %s', router_id)
+            self.metadata_driver.destroy_monitored_metadata_proxy(
+                self.process_monitor, ri.router_id, self.conf)
+
+    def _update_radvd_daemon(self, ri, state):
+        # Radvd has to be spawned only on the Master HA Router. If there are
+        # any state transitions, we enable/disable radvd accordingly.
+        if state == 'master':
+            ri.enable_radvd()
+        else:
+            ri.disable_radvd()
+
+    def notify_server(self, batched_events):
+        translation_map = {'master': 'active',
+                           'backup': 'standby',
+                           'fault': 'standby'}
+        translated_states = dict((router_id, translation_map[state]) for
+                                 router_id, state in batched_events)
+        LOG.debug('Updating server with HA routers states %s',
+                  translated_states)
+        self.plugin_rpc.update_ha_routers_states(
+            self.context, translated_states)
 
     def _init_ha_conf_path(self):
         ha_full_path = os.path.dirname("/%s/" % self.conf.ha_confs_path)
-        if not os.path.isdir(ha_full_path):
-            os.makedirs(ha_full_path, 0o755)
-
-    def get_keepalived_manager(self, ri):
-        return keepalived.KeepalivedManager(
-            ri.router['id'],
-            keepalived.KeepalivedConf(),
-            conf_path=self.conf.ha_confs_path,
-            namespace=ri.ns_name,
-            root_helper=self.root_helper)
-
-    def _init_keepalived_manager(self, ri):
-        ri.keepalived_manager = self.get_keepalived_manager(ri)
-
-        config = ri.keepalived_manager.config
-
-        interface_name = self.get_ha_device_name(ri.ha_port['id'])
-        ha_port_cidr = ri.ha_port['subnet']['cidr']
-        instance = keepalived.KeepalivedInstance(
-            'BACKUP', interface_name, ri.ha_vr_id, ha_port_cidr,
-            nopreempt=True, advert_int=self.conf.ha_vrrp_advert_int,
-            priority=ri.ha_priority)
-        instance.track_interfaces.append(interface_name)
-
-        if self.conf.ha_vrrp_auth_password:
-            # TODO(safchain): use oslo.config types when it will be available
-            # in order to check the validity of ha_vrrp_auth_type
-            instance.set_authentication(self.conf.ha_vrrp_auth_type,
-                                        self.conf.ha_vrrp_auth_password)
-
-        group = keepalived.KeepalivedGroup(ri.ha_vr_id)
-        group.add_instance(instance)
-
-        config.add_group(group)
-        config.add_instance(instance)
-
-    def process_ha_router_added(self, ri):
-        ha_port = ri.router.get(l3_constants.HA_INTERFACE_KEY)
-        if not ha_port:
-            LOG.error(_LE('Unable to process HA router %s without ha port'),
-                      ri.router_id)
-            return
-
-        self._set_subnet_info(ha_port)
-        self.ha_network_added(ri, ha_port['network_id'], ha_port['id'],
-                              ha_port['ip_cidr'], ha_port['mac_address'])
-        ri.ha_port = ha_port
-
-        self._init_keepalived_manager(ri)
-        self._add_keepalived_notifiers(ri)
-
-    def process_ha_router_removed(self, ri):
-        self.ha_network_removed(ri)
-
-    def get_ha_device_name(self, port_id):
-        return (HA_DEV_PREFIX + port_id)[:self.driver.DEV_NAME_LEN]
-
-    def ha_network_added(self, ri, network_id, port_id, internal_cidr,
-                         mac_address):
-        interface_name = self.get_ha_device_name(port_id)
-        self.driver.plug(network_id, port_id, interface_name, mac_address,
-                         namespace=ri.ns_name,
-                         prefix=HA_DEV_PREFIX)
-        self.driver.init_l3(interface_name, [internal_cidr],
-                            namespace=ri.ns_name)
-
-    def ha_network_removed(self, ri):
-        interface_name = self.get_ha_device_name(ri.ha_port['id'])
-        self.driver.unplug(interface_name, namespace=ri.ns_name,
-                           prefix=HA_DEV_PREFIX)
-        ri.ha_port = None
-
-    def _add_vip(self, ri, ip_cidr, interface, scope=None):
-        instance = ri.keepalived_manager.config.get_instance(ri.ha_vr_id)
-        instance.add_vip(ip_cidr, interface, scope)
-
-    def _remove_vip(self, ri, ip_cidr):
-        instance = ri.keepalived_manager.config.get_instance(ri.ha_vr_id)
-        instance.remove_vip_by_ip_address(ip_cidr)
-
-    def _clear_vips(self, ri, interface):
-        instance = ri.keepalived_manager.config.get_instance(ri.ha_vr_id)
-        instance.remove_vips_vroutes_by_interface(interface)
-
-    def _ha_get_existing_cidrs(self, ri, interface_name):
-        instance = ri.keepalived_manager.config.get_instance(ri.ha_vr_id)
-        return instance.get_existing_vip_ip_addresses(interface_name)
-
-    def _add_keepalived_notifiers(self, ri):
-        callback = (
-            metadata_driver.MetadataDriver._get_metadata_proxy_callback(
-                ri.router_id, self.conf))
-        pm = (
-            metadata_driver.MetadataDriver.
-            _get_metadata_proxy_process_manager(ri.router_id,
-                                                ri.ns_name,
-                                                self.conf))
-        pid = pm.get_pid_file_name(ensure_pids_dir=True)
-        ri.keepalived_manager.add_notifier(
-            callback(pid), 'master', ri.ha_vr_id)
-        for state in ('backup', 'fault'):
-            ri.keepalived_manager.add_notifier(
-                ['kill', '-%s' % signal.SIGKILL,
-                 '$(cat ' + pid + ')'], state, ri.ha_vr_id)
-
-    def _ha_external_gateway_updated(self, ri, ex_gw_port, interface_name):
-        old_gateway_cidr = ri.ex_gw_port['ip_cidr']
-        self._remove_vip(ri, old_gateway_cidr)
-        self._ha_external_gateway_added(ri, ex_gw_port, interface_name)
-
-    def _add_default_gw_virtual_route(self, ri, ex_gw_port, interface_name):
-        gw_ip = ex_gw_port['subnet']['gateway_ip']
-        if gw_ip:
-            instance = ri.keepalived_manager.config.get_instance(ri.ha_vr_id)
-            instance.virtual_routes = (
-                [route for route in instance.virtual_routes
-                 if route.destination != '0.0.0.0/0'])
-            instance.virtual_routes.append(
-                keepalived.KeepalivedVirtualRoute(
-                    '0.0.0.0/0', gw_ip, interface_name))
-
-    def _ha_external_gateway_added(self, ri, ex_gw_port, interface_name):
-        self._add_vip(ri, ex_gw_port['ip_cidr'], interface_name)
-        self._add_default_gw_virtual_route(ri, ex_gw_port, interface_name)
-
-    def _should_delete_ipv6_lladdr(self, ri, ipv6_lladdr):
-        """Only the master should have any IP addresses configured.
-        Let keepalived manage IPv6 link local addresses, the same way we let
-        it manage IPv4 addresses. In order to do that, we must delete
-        the address first as it is autoconfigured by the kernel.
-        """
-        process = keepalived.KeepalivedManager.get_process(
-            self.conf,
-            ri.router_id,
-            self.root_helper,
-            ri.ns_name,
-            self.conf.ha_confs_path)
-        if process.active:
-            manager = self.get_keepalived_manager(ri)
-            conf = manager.get_conf_on_disk()
-            managed_by_keepalived = conf and ipv6_lladdr in conf
-            if managed_by_keepalived:
-                return False
-        return True
-
-    def _ha_disable_addressing_on_interface(self, ri, interface_name):
-        """Disable IPv6 link local addressing on the device and add it as
-        a VIP to keepalived. This means that the IPv6 link local address
-        will only be present on the master.
-        """
-        device = ip_lib.IPDevice(interface_name, self.root_helper, ri.ns_name)
-        ipv6_lladdr = self._get_ipv6_lladdr(device.link.address)
-
-        if self._should_delete_ipv6_lladdr(ri, ipv6_lladdr):
-            device.addr.flush()
-
-        self._remove_vip(ri, ipv6_lladdr)
-        self._add_vip(ri, ipv6_lladdr, interface_name, scope='link')
-
-    def _get_ipv6_lladdr(self, mac_addr):
-        return '%s/64' % netaddr.EUI(mac_addr).ipv6_link_local()
-
-    def _ha_external_gateway_removed(self, ri, interface_name):
-        self._clear_vips(ri, interface_name)
-
-    def _process_virtual_routes(self, ri, new_routes):
-        instance = ri.keepalived_manager.config.get_instance(ri.ha_vr_id)
-
-        # Filter out all of the old routes while keeping only the default route
-        instance.virtual_routes = [route for route in instance.virtual_routes
-                                   if route.destination == '0.0.0.0/0']
-        for route in new_routes:
-            instance.virtual_routes.append(keepalived.KeepalivedVirtualRoute(
-                route['destination'],
-                route['nexthop']))
-
-    def get_ha_routers(self):
-        return (router for router in self.router_info.values() if router.is_ha)
-
-    @periodic_task.periodic_task
-    def _ensure_keepalived_alive(self, context):
-        # TODO(amuller): Use external_process.ProcessMonitor
-        for router in self.get_ha_routers():
-            router.keepalived_manager.revive()
+        common_utils.ensure_dir(ha_full_path)

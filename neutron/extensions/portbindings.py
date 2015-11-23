@@ -47,34 +47,40 @@ CAP_PORT_FILTER = 'port_filter'
 OVS_HYBRID_PLUG = 'ovs_hybrid_plug'
 VIF_DETAILS_VLAN = 'vlan'
 
+# The keys below are used in the VIF_DETAILS attribute to convey
+# information related to the configuration of the vhost-user VIF driver.
+
+# - vhost_user_mode: String value used to declare the mode of a
+#                    vhost-user socket
+VHOST_USER_MODE = 'vhostuser_mode'
+# - server: socket created by hypervisor
+VHOST_USER_MODE_SERVER = 'server'
+# - client: socket created by vswitch
+VHOST_USER_MODE_CLIENT = 'client'
+# - vhostuser_socket String value used to declare the vhostuser socket name
+VHOST_USER_SOCKET = 'vhostuser_socket'
+# - vhost_user_ovs_plug: Boolean used to inform Nova that the ovs plug
+#                        method should be used when binding the
+#                        vhost-user vif.
+VHOST_USER_OVS_PLUG = 'vhostuser_ovs_plug'
+# - vhost-user:  The vhost-user interface type is a standard virtio interface
+#                provided by qemu 2.1+. This constant defines the neutron side
+#                of the vif binding type to provide a common definition
+#                to enable reuse in multiple agents and drivers.
+VIF_TYPE_VHOST_USER = 'vhostuser'
+
 VIF_TYPE_UNBOUND = 'unbound'
 VIF_TYPE_BINDING_FAILED = 'binding_failed'
 VIF_TYPE_DISTRIBUTED = 'distributed'
-VIF_TYPE_IOVISOR = 'iovisor'
 VIF_TYPE_OVS = 'ovs'
-VIF_TYPE_IVS = 'ivs'
-VIF_TYPE_DVS = 'dvs'
 VIF_TYPE_BRIDGE = 'bridge'
-VIF_TYPE_802_QBG = '802.1qbg'
-VIF_TYPE_802_QBH = '802.1qbh'
-VIF_TYPE_HYPERV = 'hyperv'
-VIF_TYPE_MIDONET = 'midonet'
-VIF_TYPE_MLNX_DIRECT = 'mlnx_direct'
-VIF_TYPE_MLNX_HOSTDEV = 'hostdev'
-VIF_TYPE_HW_VEB = 'hw_veb'
-VIF_TYPE_VROUTER = 'vrouter'
 VIF_TYPE_OTHER = 'other'
-VIF_TYPES = [VIF_TYPE_UNBOUND, VIF_TYPE_BINDING_FAILED, VIF_TYPE_OVS,
-             VIF_TYPE_IVS, VIF_TYPE_BRIDGE, VIF_TYPE_802_QBG,
-             VIF_TYPE_802_QBH, VIF_TYPE_HYPERV, VIF_TYPE_MIDONET,
-             VIF_TYPE_MLNX_DIRECT, VIF_TYPE_MLNX_HOSTDEV, VIF_TYPE_HW_VEB,
-             VIF_TYPE_DVS, VIF_TYPE_OTHER, VIF_TYPE_DISTRIBUTED,
-             VIF_TYPE_VROUTER]
 
 VNIC_NORMAL = 'normal'
 VNIC_DIRECT = 'direct'
 VNIC_MACVTAP = 'macvtap'
-VNIC_TYPES = [VNIC_NORMAL, VNIC_DIRECT, VNIC_MACVTAP]
+VNIC_BAREMETAL = 'baremetal'
+VNIC_TYPES = [VNIC_NORMAL, VNIC_DIRECT, VNIC_MACVTAP, VNIC_BAREMETAL]
 
 EXTENDED_ATTRIBUTES_2_0 = {
     'ports': {
@@ -124,10 +130,6 @@ class Portbindings(extensions.ExtensionDescriptor):
     @classmethod
     def get_description(cls):
         return "Expose port bindings of a virtual port to external application"
-
-    @classmethod
-    def get_namespace(cls):
-        return "http://docs.openstack.org/ext/binding/api/v1.0"
 
     @classmethod
     def get_updated(cls):

@@ -14,7 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_config import cfg
 
 DHCP_AGENT_OPTS = [
     cfg.IntOpt('resync_interval', default=5,
@@ -24,16 +24,14 @@ DHCP_AGENT_OPTS = [
                help=_("The driver used to manage the DHCP server.")),
     cfg.BoolOpt('enable_isolated_metadata', default=False,
                 help=_("Support Metadata requests on isolated networks.")),
+    cfg.BoolOpt('force_metadata', default=False,
+                help=_("Force to use DHCP to get Metadata on all networks.")),
     cfg.BoolOpt('enable_metadata_network', default=False,
                 help=_("Allows for serving metadata requests from a "
                        "dedicated network. Requires "
                        "enable_isolated_metadata = True")),
     cfg.IntOpt('num_sync_threads', default=4,
-               help=_('Number of threads to use during sync process.')),
-    cfg.StrOpt('metadata_proxy_socket',
-               default='$state_path/metadata_proxy',
-               help=_('Location of Metadata Proxy UNIX domain '
-                      'socket')),
+               help=_('Number of threads to use during sync process.'))
 ]
 
 DHCP_OPTS = [
@@ -42,7 +40,11 @@ DHCP_OPTS = [
                help=_('Location to store DHCP server config files')),
     cfg.StrOpt('dhcp_domain',
                default='openstacklocal',
-               help=_('Domain to use for building the hostnames')),
+               help=_('Domain to use for building the hostnames.'
+                      'This option is deprecated. It has been moved to '
+                      'neutron.conf as dns_domain. It will removed from here '
+                      'in a future release'),
+               deprecated_for_removal=True),
 ]
 
 DNSMASQ_OPTS = [
@@ -53,8 +55,11 @@ DNSMASQ_OPTS = [
                 help=_('Comma-separated list of the DNS servers which will be '
                        'used as forwarders.'),
                 deprecated_name='dnsmasq_dns_server'),
-    cfg.BoolOpt('dhcp_delete_namespaces', default=False,
-                help=_("Delete namespace after removing a dhcp server.")),
+    cfg.StrOpt('dnsmasq_base_log_dir',
+               help=_("Base log dir for dnsmasq logging. "
+                      "The log contains DHCP and DNS log information and "
+                      "is useful for debugging issues with either DHCP or "
+                      "DNS. If this section is null, disable dnsmasq log.")),
     cfg.IntOpt(
         'dnsmasq_lease_max',
         default=(2 ** 24),

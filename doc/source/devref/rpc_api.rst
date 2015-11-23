@@ -1,4 +1,26 @@
-=====================
+..
+      Licensed under the Apache License, Version 2.0 (the "License"); you may
+      not use this file except in compliance with the License. You may obtain
+      a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+      Unless required by applicable law or agreed to in writing, software
+      distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+      WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+      License for the specific language governing permissions and limitations
+      under the License.
+
+
+      Convention for heading levels in Neutron devref:
+      =======  Heading 0 (reserved for the title in a document)
+      -------  Heading 1
+      ~~~~~~~  Heading 2
+      +++++++  Heading 3
+      '''''''  Heading 4
+      (Avoid deeper levels because they do not render well.)
+
+
 Neutron RPC API Layer
 =====================
 
@@ -10,13 +32,13 @@ could be some other protocol in the future.
 RPC APIs are defined in Neutron in two parts: client side and server side.
 
 Client Side
-===========
+-----------
 
 Here is an example of an rpc client definition:
 
 ::
 
-  from oslo import messaging
+  import oslo_messaging
 
   from neutron.common import rpc as n_rpc
 
@@ -30,7 +52,7 @@ Here is an example of an rpc client definition:
       """
 
       def __init__(self, topic):
-          target = messaging.Target(topic=topic, version='1.0')
+          target = oslo_messaging.Target(topic=topic, version='1.0')
           self.client = n_rpc.get_client(target)
 
       def my_remote_method(self, context, arg1, arg2):
@@ -49,18 +71,18 @@ specifies that the remote side must implement at least version 1.1 to handle
 this request.
 
 Server Side
-===========
+-----------
 
 The server side of an rpc interface looks like this:
 
 ::
 
-  from oslo import messaging
+  import oslo_messaging
 
 
   class ServerAPI(object):
 
-      target = messaging.Target(version='1.1')
+      target = oslo_messaging.Target(version='1.1')
 
       def my_remote_method(self, context, arg1, arg2):
           return 'foo'
@@ -69,11 +91,12 @@ The server side of an rpc interface looks like this:
           return 'bar'
 
 
-This class implements the server side of the interface.  The messaging.Target()
-defined says that this class currently implements version 1.1 of the interface.
+This class implements the server side of the interface.  The
+oslo_messaging.Target() defined says that this class currently implements
+version 1.1 of the interface.
 
 Versioning
-==========
+----------
 
 Note that changes to rpc interfaces must always be done in a backwards
 compatible way.  The server side should always be able to handle older clients
@@ -84,7 +107,7 @@ for backwards compatibility.  For more information about how to do that, see
 https://wiki.openstack.org/wiki/RpcMajorVersionUpdates.
 
 Example Change
---------------
+~~~~~~~~~~~~~~
 
 As an example minor API change, let's assume we want to add a new parameter to
 my_remote_method_2.  First, we add the argument on the server side.  To be
@@ -95,12 +118,12 @@ code would look like this:
 
 ::
 
-  from oslo import messaging
+  import oslo_messaging
 
 
   class ServerAPI(object):
 
-      target = messaging.Target(version='1.2')
+      target = oslo_messaging.Target(version='1.2')
 
       def my_remote_method(self, context, arg1, arg2):
           return 'foo'
@@ -116,7 +139,7 @@ successful.  The updated client side would look like this:
 
 ::
 
-  from oslo import messaging
+  import oslo_messaging
 
   from neutron.common import rpc as n_rpc
 
@@ -131,7 +154,7 @@ successful.  The updated client side would look like this:
       """
 
       def __init__(self, topic):
-          target = messaging.Target(topic=topic, version='1.0')
+          target = oslo_messaging.Target(topic=topic, version='1.0')
           self.client = n_rpc.get_client(target)
 
       def my_remote_method(self, context, arg1, arg2):
@@ -144,7 +167,7 @@ successful.  The updated client side would look like this:
                             arg1=arg1, arg2=arg2)
 
 Neutron RPC APIs
-================
+----------------
 
 As discussed before, RPC APIs are defined in two parts: a client side and a
 server side.  Several of these pairs exist in the Neutron code base.  The code
@@ -152,7 +175,7 @@ base is being updated with documentation on every rpc interface implementation
 that indicates where the corresponding server or client code is located.
 
 Example: DHCP
--------------
+~~~~~~~~~~~~~
 
 The DHCP agent includes a client API, neutron.agent.dhcp.agent.DhcpPluginAPI.
 The DHCP agent uses this class to call remote methods back in the Neutron
@@ -168,7 +191,7 @@ server side of this interface that runs in the DHCP agent is
 neutron.agent.dhcp.agent.DhcpAgent.
 
 More Info
-=========
+---------
 
 For more information, see the oslo.messaging documentation:
 http://docs.openstack.org/developer/oslo.messaging/.

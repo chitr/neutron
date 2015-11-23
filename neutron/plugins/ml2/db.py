@@ -13,20 +13,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_db import exception as db_exc
+from oslo_log import log
+from oslo_utils import uuidutils
+import six
 from sqlalchemy import or_
 from sqlalchemy.orm import exc
 
-from oslo.db import exception as db_exc
-
 from neutron.common import constants as n_const
-from neutron.db import api as db_api
 from neutron.db import models_v2
 from neutron.db import securitygroups_db as sg_db
 from neutron.extensions import portbindings
 from neutron.i18n import _LE, _LI
 from neutron import manager
-from neutron.openstack.common import log
-from neutron.openstack.common import uuidutils
 from neutron.plugins.ml2 import driver_api as api
 from neutron.plugins.ml2 import models
 
@@ -152,6 +151,44 @@ def get_locked_port_and_binding(session, port_id):
         return None, None
 
 
+def set_binding_levels(session, levels):
+    if levels:
+        for level in levels:
+            session.add(level)
+        LOG.debug("For port %(port_id)s, host %(host)s, "
+                  "set binding levels %(levels)s",
+                  {'port_id': levels[0].port_id,
+                   'host': levels[0].host,
+                   'levels': levels})
+    else:
+        LOG.debug("Attempted to set empty binding levels")
+
+
+def get_binding_levels(session, port_id, host):
+    if host:
+        result = (session.query(models.PortBindingLevel).
+                  filter_by(port_id=port_id, host=host).
+                  order_by(models.PortBindingLevel.level).
+                  all())
+        LOG.debug("For port %(port_id)s, host %(host)s, "
+                  "got binding levels %(levels)s",
+                  {'port_id': port_id,
+                   'host': host,
+                   'levels': result})
+        return result
+
+
+def clear_binding_levels(session, port_id, host):
+    if host:
+        (session.query(models.PortBindingLevel).
+         filter_by(port_id=port_id, host=host).
+         delete())
+        LOG.debug("For port %(port_id)s, host %(host)s, "
+                  "cleared binding levels",
+                  {'port_id': port_id,
+                   'host': host})
+
+
 def ensure_dvr_port_binding(session, port_id, host, router_id=None):
     record = (session.query(models.DVRPortBinding).
               filter_by(port_id=port_id, host=host).first())
@@ -166,7 +203,6 @@ def ensure_dvr_port_binding(session, port_id, host, router_id=None):
                 router_id=router_id,
                 vif_type=portbindings.VIF_TYPE_UNBOUND,
                 vnic_type=portbindings.VNIC_NORMAL,
-                cap_port_filter=False,
                 status=n_const.PORT_STATUS_DOWN)
             session.add(record)
             return record
@@ -191,11 +227,12 @@ def delete_dvr_port_binding_if_stale(session, binding):
 
 
 def get_port(session, port_id):
-    """Get port record for update within transcation."""
+    """Get port record for update within transaction."""
 
     with session.begin(subtransactions=True):
         try:
             record = (session.query(models_v2.Port).
+                      enable_eagerloads(False).
                       filter(models_v2.Port.id.startswith(port_id)).
                       one())
             return record
@@ -207,14 +244,14 @@ def get_port(session, port_id):
             return
 
 
-def get_port_from_device_mac(device_mac):
+def get_port_from_device_mac(context, device_mac):
     LOG.debug("get_port_from_device_mac() called for mac %s", device_mac)
-    session = db_api.get_session()
-    qry = session.query(models_v2.Port).filter_by(mac_address=device_mac)
+    qry = context.session.query(models_v2.Port).filter_by(
+        mac_address=device_mac)
     return qry.first()
 
 
-def get_ports_and_sgs(port_ids):
+def get_ports_and_sgs(context, port_ids):
     """Get ports from database with security group info."""
 
     # break large queries into smaller parts
@@ -222,25 +259,24 @@ def get_ports_and_sgs(port_ids):
         LOG.debug("Number of ports %(pcount)s exceeds the maximum per "
                   "query %(maxp)s. Partitioning queries.",
                   {'pcount': len(port_ids), 'maxp': MAX_PORTS_PER_QUERY})
-        return (get_ports_and_sgs(port_ids[:MAX_PORTS_PER_QUERY]) +
-                get_ports_and_sgs(port_ids[MAX_PORTS_PER_QUERY:]))
+        return (get_ports_and_sgs(context, port_ids[:MAX_PORTS_PER_QUERY]) +
+                get_ports_and_sgs(context, port_ids[MAX_PORTS_PER_QUERY:]))
 
     LOG.debug("get_ports_and_sgs() called for port_ids %s", port_ids)
 
     if not port_ids:
         # if port_ids is empty, avoid querying to DB to ask it for nothing
         return []
-    ports_to_sg_ids = get_sg_ids_grouped_by_port(port_ids)
+    ports_to_sg_ids = get_sg_ids_grouped_by_port(context, port_ids)
     return [make_port_dict_with_security_groups(port, sec_groups)
-            for port, sec_groups in ports_to_sg_ids.iteritems()]
+            for port, sec_groups in six.iteritems(ports_to_sg_ids)]
 
 
-def get_sg_ids_grouped_by_port(port_ids):
+def get_sg_ids_grouped_by_port(context, port_ids):
     sg_ids_grouped_by_port = {}
-    session = db_api.get_session()
     sg_binding_port = sg_db.SecurityGroupPortBinding.port_id
 
-    with session.begin(subtransactions=True):
+    with context.session.begin(subtransactions=True):
         # partial UUIDs must be individually matched with startswith.
         # full UUIDs may be matched directly in an IN statement
         partial_uuids = set(port_id for port_id in port_ids
@@ -251,8 +287,8 @@ def get_sg_ids_grouped_by_port(port_ids):
         if full_uuids:
             or_criteria.append(models_v2.Port.id.in_(full_uuids))
 
-        query = session.query(models_v2.Port,
-                              sg_db.SecurityGroupPortBinding.security_group_id)
+        query = context.session.query(
+            models_v2.Port, sg_db.SecurityGroupPortBinding.security_group_id)
         query = query.outerjoin(sg_db.SecurityGroupPortBinding,
                                 models_v2.Port.id == sg_binding_port)
         query = query.filter(or_(*or_criteria))
@@ -276,21 +312,20 @@ def make_port_dict_with_security_groups(port, sec_groups):
     return port_dict
 
 
-def get_port_binding_host(port_id):
-    session = db_api.get_session()
-    with session.begin(subtransactions=True):
-        try:
+def get_port_binding_host(session, port_id):
+    try:
+        with session.begin(subtransactions=True):
             query = (session.query(models.PortBinding).
                      filter(models.PortBinding.port_id.startswith(port_id)).
                      one())
-        except exc.NoResultFound:
-            LOG.debug("No binding found for port %(port_id)s",
-                      {'port_id': port_id})
-            return
-        except exc.MultipleResultsFound:
-            LOG.error(_LE("Multiple ports have port_id starting with %s"),
-                      port_id)
-            return
+    except exc.NoResultFound:
+        LOG.debug("No binding found for port %(port_id)s",
+                  {'port_id': port_id})
+        return
+    except exc.MultipleResultsFound:
+        LOG.error(_LE("Multiple ports have port_id starting with %s"),
+                  port_id)
+        return
     return query.host
 
 

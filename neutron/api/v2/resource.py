@@ -20,15 +20,15 @@ Utility methods for working with WSGI servers redux
 import sys
 
 import netaddr
-from oslo import i18n
+import oslo_i18n
+from oslo_log import log as logging
+from oslo_policy import policy as oslo_policy
 import six
 import webob.dec
 import webob.exc
 
 from neutron.common import exceptions
 from neutron.i18n import _LE, _LI
-from neutron.openstack.common import log as logging
-from neutron.openstack.common import policy as common_policy
 from neutron import wsgi
 
 
@@ -83,7 +83,7 @@ def Resource(controller, faults=None, deserializers=None, serializers=None):
             result = method(request=request, **args)
         except (exceptions.NeutronException,
                 netaddr.AddrFormatError,
-                common_policy.PolicyNotAuthorized) as e:
+                oslo_policy.PolicyNotAuthorized) as e:
             for fault in faults:
                 if isinstance(e, fault):
                     mapped_exc = faults[fault]
@@ -102,7 +102,11 @@ def Resource(controller, faults=None, deserializers=None, serializers=None):
             raise mapped_exc(**kwargs)
         except webob.exc.HTTPException as e:
             type_, value, tb = sys.exc_info()
-            LOG.exception(_LE('%s failed'), action)
+            if hasattr(e, 'code') and 400 <= e.code < 500:
+                LOG.info(_LI('%(action)s failed (client error): %(exc)s'),
+                         {'action': action, 'exc': e})
+            else:
+                LOG.exception(_LE('%s failed'), action)
             translate(e, language)
             value.body = serializer.serialize(
                 {'NeutronError': get_exception_data(e)})
@@ -173,13 +177,13 @@ def translate(translatable, locale):
     :returns: the translated object, or the object as-is if it
               was not translated
     """
-    localize = i18n.translate
+    localize = oslo_i18n.translate
     if isinstance(translatable, exceptions.NeutronException):
         translatable.msg = localize(translatable.msg, locale)
     elif isinstance(translatable, webob.exc.HTTPError):
         translatable.detail = localize(translatable.detail, locale)
     elif isinstance(translatable, Exception):
-        translatable.message = localize(translatable.message, locale)
+        translatable.message = localize(translatable, locale)
     else:
         return localize(translatable, locale)
     return translatable

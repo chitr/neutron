@@ -80,11 +80,8 @@ def upgrade():
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('rule_id', 'nexthop'))
 
-
-def downgrade():
-    op.drop_table('nexthops')
-    op.drop_table('routerrules')
-    op.drop_table('routerflavors')
-    op.drop_table('networkflavors')
-    op.drop_table('hyperv_network_bindings')
-    op.drop_table('hyperv_vlan_allocations')
+    op.create_table(
+        'consistencyhashes',
+        sa.Column('hash_id', sa.String(255), primary_key=True),
+        sa.Column('hash', sa.String(255), nullable=False)
+    )

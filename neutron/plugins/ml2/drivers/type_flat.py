@@ -13,25 +13,28 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
-from oslo.db import exception as db_exc
+from oslo_config import cfg
+from oslo_db import exception as db_exc
+from oslo_log import log
+import six
 import sqlalchemy as sa
 
 from neutron.common import exceptions as exc
 from neutron.db import model_base
 from neutron.i18n import _LI, _LW
-from neutron.openstack.common import log
 from neutron.plugins.common import constants as p_const
 from neutron.plugins.ml2 import driver_api as api
+from neutron.plugins.ml2.drivers import helpers
 
 LOG = log.getLogger(__name__)
 
 flat_opts = [
     cfg.ListOpt('flat_networks',
-                default=[],
+                default='*',
                 help=_("List of physical_network names with which flat "
-                       "networks can be created. Use * to allow flat "
-                       "networks with arbitrary physical_network names."))
+                       "networks can be created. Use default '*' to allow "
+                       "flat networks with arbitrary physical_network names. "
+                       "Use an empty list to disable flat networks."))
 ]
 
 cfg.CONF.register_opts(flat_opts, "ml2_type_flat")
@@ -50,7 +53,7 @@ class FlatAllocation(model_base.BASEV2):
                                  primary_key=True)
 
 
-class FlatTypeDriver(api.TypeDriver):
+class FlatTypeDriver(helpers.BaseTypeDriver):
     """Manage state for flat networks with ML2.
 
     The FlatTypeDriver implements the 'flat' network_type. Flat
@@ -62,6 +65,7 @@ class FlatTypeDriver(api.TypeDriver):
     """
 
     def __init__(self):
+        super(FlatTypeDriver, self).__init__()
         self._parse_networks(cfg.CONF.ml2_type_flat.flat_networks)
 
     def _parse_networks(self, entries):
@@ -69,9 +73,8 @@ class FlatTypeDriver(api.TypeDriver):
         if '*' in self.flat_networks:
             LOG.info(_LI("Arbitrary flat physical_network names allowed"))
             self.flat_networks = None
-        elif not all(self.flat_networks):
-            msg = _("physical network name is empty")
-            raise exc.InvalidInput(error_message=msg)
+        elif not self.flat_networks:
+            LOG.info(_LI("Flat networks are disabled"))
         else:
             LOG.info(_LI("Allowable flat physical_network names: %s"),
                      self.flat_networks)
@@ -90,12 +93,15 @@ class FlatTypeDriver(api.TypeDriver):
         if not physical_network:
             msg = _("physical_network required for flat provider network")
             raise exc.InvalidInput(error_message=msg)
+        if self.flat_networks is not None and not self.flat_networks:
+            msg = _("Flat provider networks are disabled")
+            raise exc.InvalidInput(error_message=msg)
         if self.flat_networks and physical_network not in self.flat_networks:
             msg = (_("physical_network '%s' unknown for flat provider network")
                    % physical_network)
             raise exc.InvalidInput(error_message=msg)
 
-        for key, value in segment.iteritems():
+        for key, value in six.iteritems(segment):
             if value and key not in [api.NETWORK_TYPE,
                                      api.PHYSICAL_NETWORK]:
                 msg = _("%s prohibited for flat provider network") % key
@@ -112,6 +118,7 @@ class FlatTypeDriver(api.TypeDriver):
             except db_exc.DBDuplicateEntry:
                 raise exc.FlatNetworkInUse(
                     physical_network=physical_network)
+            segment[api.MTU] = self.get_mtu(alloc.physical_network)
         return segment
 
     def allocate_tenant_segment(self, session):
@@ -130,3 +137,12 @@ class FlatTypeDriver(api.TypeDriver):
         else:
             LOG.warning(_LW("No flat network found on physical network %s"),
                         physical_network)
+
+    def get_mtu(self, physical_network):
+        seg_mtu = super(FlatTypeDriver, self).get_mtu()
+        mtu = []
+        if seg_mtu > 0:
+            mtu.append(seg_mtu)
+        if physical_network in self.physnet_mtus:
+            mtu.append(int(self.physnet_mtus[physical_network]))
+        return min(mtu) if mtu else 0

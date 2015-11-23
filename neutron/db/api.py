@@ -13,10 +13,28 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
-from oslo.db.sqlalchemy import session
+import contextlib
+
+from oslo_config import cfg
+from oslo_db import api as oslo_db_api
+from oslo_db import exception as db_exc
+from oslo_db.sqlalchemy import session
+from oslo_utils import uuidutils
+from sqlalchemy import exc
+
+from neutron.common import exceptions as n_exc
+from neutron.db import common_db_mixin
+
 
 _FACADE = None
+
+MAX_RETRIES = 10
+is_deadlock = lambda e: isinstance(e, db_exc.DBDeadlock)
+retry_db_errors = oslo_db_api.wrap_db_retry(
+    max_retries=MAX_RETRIES,
+    retry_on_request=True,
+    exception_checker=is_deadlock
+)
 
 
 def _create_facade_lazily():
@@ -34,8 +52,72 @@ def get_engine():
     return facade.get_engine()
 
 
-def get_session(autocommit=True, expire_on_commit=False):
+def dispose():
+    # Don't need to do anything if an enginefacade hasn't been created
+    if _FACADE is not None:
+        get_engine().pool.dispose()
+
+
+def get_session(autocommit=True, expire_on_commit=False, use_slave=False):
     """Helper method to grab session."""
     facade = _create_facade_lazily()
     return facade.get_session(autocommit=autocommit,
-                              expire_on_commit=expire_on_commit)
+                              expire_on_commit=expire_on_commit,
+                              use_slave=use_slave)
+
+
+@contextlib.contextmanager
+def autonested_transaction(sess):
+    """This is a convenience method to not bother with 'nested' parameter."""
+    try:
+        session_context = sess.begin_nested()
+    except exc.InvalidRequestError:
+        session_context = sess.begin(subtransactions=True)
+    finally:
+        with session_context as tx:
+            yield tx
+
+
+# Common database operation implementations
+def get_object(context, model, **kwargs):
+    with context.session.begin(subtransactions=True):
+        return (common_db_mixin.model_query(context, model)
+                .filter_by(**kwargs)
+                .first())
+
+
+def get_objects(context, model, **kwargs):
+    with context.session.begin(subtransactions=True):
+        return (common_db_mixin.model_query(context, model)
+                .filter_by(**kwargs)
+                .all())
+
+
+def create_object(context, model, values):
+    with context.session.begin(subtransactions=True):
+        if 'id' not in values:
+            values['id'] = uuidutils.generate_uuid()
+        db_obj = model(**values)
+        context.session.add(db_obj)
+    return db_obj.__dict__
+
+
+def _safe_get_object(context, model, id):
+    db_obj = get_object(context, model, id=id)
+    if db_obj is None:
+        raise n_exc.ObjectNotFound(id=id)
+    return db_obj
+
+
+def update_object(context, model, id, values):
+    with context.session.begin(subtransactions=True):
+        db_obj = _safe_get_object(context, model, id)
+        db_obj.update(values)
+        db_obj.save(session=context.session)
+    return db_obj.__dict__
+
+
+def delete_object(context, model, id):
+    with context.session.begin(subtransactions=True):
+        db_obj = _safe_get_object(context, model, id)
+        context.session.delete(db_obj)

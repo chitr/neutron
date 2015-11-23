@@ -35,27 +35,13 @@ UC_2_NAME = 'uniq_ipavailabilityranges0last_ip0allocation_pool_id'
 
 def upgrade():
     op.create_unique_constraint(
-        name=UC_1_NAME,
-        source=TABLE_NAME,
-        local_cols=['first_ip', 'allocation_pool_id']
+        constraint_name=UC_1_NAME,
+        table_name=TABLE_NAME,
+        columns=['first_ip', 'allocation_pool_id']
     )
 
     op.create_unique_constraint(
-        name=UC_2_NAME,
-        source=TABLE_NAME,
-        local_cols=['last_ip', 'allocation_pool_id']
-    )
-
-
-def downgrade():
-    op.drop_constraint(
-        name=UC_1_NAME,
+        constraint_name=UC_2_NAME,
         table_name=TABLE_NAME,
-        type_='unique'
-    )
-
-    op.drop_constraint(
-        name=UC_2_NAME,
-        table_name=TABLE_NAME,
-        type_='unique'
+        columns=['last_ip', 'allocation_pool_id']
     )

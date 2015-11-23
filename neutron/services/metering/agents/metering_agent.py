@@ -15,12 +15,13 @@
 import sys
 import time
 
-import eventlet
-eventlet.monkey_patch()
-
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging
+from oslo_service import loopingcall
+from oslo_service import periodic_task
+from oslo_service import service
+from oslo_utils import importutils
 
 from neutron.agent.common import config
 from neutron.agent import rpc as agent_rpc
@@ -32,10 +33,6 @@ from neutron.common import utils
 from neutron import context
 from neutron.i18n import _LE, _LI, _LW
 from neutron import manager
-from neutron.openstack.common import log as logging
-from neutron.openstack.common import loopingcall
-from neutron.openstack.common import periodic_task
-from neutron.openstack.common import service
 from neutron import service as neutron_service
 
 
@@ -50,7 +47,8 @@ class MeteringPluginRpc(object):
         # it's actually necessary to initialize parent classes of
         # manager.Manager correctly.
         super(MeteringPluginRpc, self).__init__()
-        target = messaging.Target(topic=topics.METERING_PLUGIN, version='1.0')
+        target = oslo_messaging.Target(topic=topics.METERING_PLUGIN,
+                                       version='1.0')
         self.client = n_rpc.get_client(target)
 
     def _get_sync_data_metering(self, context):
@@ -78,9 +76,7 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
     def __init__(self, host, conf=None):
         self.conf = conf or cfg.CONF
         self._load_drivers()
-        self.root_helper = config.get_root_helper(self.conf)
         self.context = context.get_admin_context_without_session()
-        self.metering_info = {}
         self.metering_loop = loopingcall.FixedIntervalLoopingCall(
             self._metering_loop
         )
@@ -121,11 +117,13 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
             info['time'] = 0
 
     def _purge_metering_info(self):
-        ts = int(time.time())
-        report_interval = self.conf.report_interval
-        for label_id, info in self.metering_info.items():
-            if info['last_update'] > ts + report_interval:
-                del self.metering_info[label_id]
+        deadline_timestamp = int(time.time()) - self.conf.report_interval
+        label_ids = [
+            label_id
+            for label_id, info in self.metering_infos.items()
+            if info['last_update'] < deadline_timestamp]
+        for label_id in label_ids:
+            del self.metering_infos[label_id]
 
     def _add_metering_info(self, label_id, pkts, bytes):
         ts = int(time.time())
@@ -219,6 +217,14 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
         LOG.debug("Get router traffic counters")
         return self._invoke_driver(context, routers, 'get_traffic_counters')
 
+    def add_metering_label_rule(self, context, routers):
+        return self._invoke_driver(context, routers,
+                                   'add_metering_label_rule')
+
+    def remove_metering_label_rule(self, context, routers):
+        return self._invoke_driver(context, routers,
+                                   'remove_metering_label_rule')
+
     def update_metering_label_rules(self, context, routers):
         LOG.debug("Update metering rules from agent")
         return self._invoke_driver(context, routers,
@@ -242,7 +248,7 @@ class MeteringAgentWithStateReport(MeteringAgent):
     def __init__(self, host, conf=None):
         super(MeteringAgentWithStateReport, self).__init__(host=host,
                                                            conf=conf)
-        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.PLUGIN)
+        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.REPORTS)
         self.agent_state = {
             'binary': 'neutron-metering-agent',
             'host': host,
@@ -285,7 +291,6 @@ def main():
     conf = cfg.CONF
     conf.register_opts(MeteringAgent.Opts)
     config.register_agent_state_opts_helper(conf)
-    config.register_root_helper(conf)
     common_config.init(sys.argv[1:])
     config.setup_logging()
     server = neutron_service.Service.create(
@@ -294,4 +299,4 @@ def main():
         report_interval=cfg.CONF.AGENT.report_interval,
         manager='neutron.services.metering.agents.'
                 'metering_agent.MeteringAgentWithStateReport')
-    service.launch(server).wait()
+    service.launch(cfg.CONF, server).wait()

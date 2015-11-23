@@ -13,13 +13,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+import importlib
+import os
+
+from oslo_config import cfg
+from oslo_log import log as logging
 import stevedore
 
 from neutron.common import exceptions as n_exc
 from neutron.i18n import _LW
-from neutron.openstack.common import log as logging
-from neutron.plugins.common import constants
 
 LOG = logging.getLogger(__name__)
 
@@ -33,6 +35,69 @@ serviceprovider_opts = [
 ]
 
 cfg.CONF.register_opts(serviceprovider_opts, 'service_providers')
+
+
+class NeutronModule(object):
+    """A Neutron extension module."""
+
+    def __init__(self, service_module):
+        self.module_name = service_module
+        self.repo = {
+            'mod': self._import_or_none(),
+            'ini': None
+        }
+
+    def _import_or_none(self):
+            try:
+                return importlib.import_module(self.module_name)
+            except ImportError:
+                return None
+
+    def installed(self):
+        LOG.debug("NeutronModule installed = %s", self.module_name)
+        return self.module_name
+
+    def module(self):
+        return self.repo['mod']
+
+    # Return an INI parser for the child module
+    def ini(self, neutron_dir=None):
+        if self.repo['ini'] is None:
+            try:
+                neutron_dir = neutron_dir or cfg.CONF.config_dir
+            except cfg.NoSuchOptError:
+                pass
+            if neutron_dir is None:
+                neutron_dir = '/etc/neutron'
+
+            ini_file = cfg.ConfigOpts()
+            ini_file.register_opts(serviceprovider_opts, 'service_providers')
+            ini_path = os.path.join(neutron_dir, '%s.conf' % self.module_name)
+            if os.path.exists(ini_path):
+                ini_file(['--config-file', ini_path])
+            self.repo['ini'] = ini_file
+
+        return self.repo['ini']
+
+    def service_providers(self):
+        """Return the service providers for the extension module."""
+        providers = []
+        # Attempt to read the config from cfg.CONF first; when passing
+        # --config-dir, the option is merged from all the definitions
+        # made across all the imported config files
+        try:
+            providers = cfg.CONF.service_providers.service_provider
+        except cfg.NoSuchOptError:
+            pass
+
+        # Alternatively, if the option is not available, try to load
+        # it from the provider module's config file; this may be
+        # necessary, if modules are loaded on the fly (DevStack may
+        # be an example)
+        if not providers:
+            providers = self.ini().service_providers.service_provider
+
+        return providers
 
 
 #global scope function that should be used in service APIs
@@ -50,6 +115,8 @@ def get_provider_driver_class(driver, namespace=SERVICE_PROVIDERS):
     try:
         driver_manager = stevedore.driver.DriverManager(
             namespace, driver).driver
+    except ImportError:
+        return driver
     except RuntimeError:
         return driver
     new_driver = "%s.%s" % (driver_manager.__module__,
@@ -62,14 +129,19 @@ def get_provider_driver_class(driver, namespace=SERVICE_PROVIDERS):
     return new_driver
 
 
-def parse_service_provider_opt():
+def parse_service_provider_opt(service_module='neutron'):
+
     """Parse service definition opts and returns result."""
     def validate_name(name):
         if len(name) > 255:
             raise n_exc.Invalid(
                 _("Provider name is limited by 255 characters: %s") % name)
 
-    svc_providers_opt = cfg.CONF.service_providers.service_provider
+    neutron_mod = NeutronModule(service_module)
+    svc_providers_opt = neutron_mod.service_providers()
+
+    LOG.debug("Service providers = %s", svc_providers_opt)
+
     res = []
     for prov_def in svc_providers_opt:
         split = prov_def.split(':')
@@ -89,13 +161,7 @@ def parse_service_provider_opt():
                        prov_def)
                 LOG.error(msg)
                 raise n_exc.Invalid(msg)
-        if svc_type not in constants.ALLOWED_SERVICES:
-            msg = (_("Service type '%(svc_type)s' is not allowed, "
-                     "allowed types: %(allowed)s") %
-                   {'svc_type': svc_type,
-                    'allowed': constants.ALLOWED_SERVICES})
-            LOG.error(msg)
-            raise n_exc.Invalid(msg)
+
         driver = get_provider_driver_class(driver)
         res.append({'service_type': svc_type,
                     'name': name,
@@ -120,9 +186,10 @@ class ServiceProviderAlreadyAssociated(n_exc.Conflict):
 
 
 class ProviderConfiguration(object):
-    def __init__(self, prov_data):
+
+    def __init__(self, svc_module='neutron'):
         self.providers = {}
-        for prov in prov_data:
+        for prov in parse_service_provider_opt(svc_module):
             self.add_provider(prov)
 
     def _ensure_driver_unique(self, driver):
@@ -130,7 +197,7 @@ class ProviderConfiguration(object):
             if v['driver'] == driver:
                 msg = (_("Driver %s is not unique across providers") %
                        driver)
-                LOG.exception(msg)
+                LOG.error(msg)
                 raise n_exc.Invalid(msg)
 
     def _ensure_default_unique(self, type, default):
@@ -140,7 +207,7 @@ class ProviderConfiguration(object):
             if k[0] == type and v['default']:
                 msg = _("Multiple default providers "
                         "for service %s") % type
-                LOG.exception(msg)
+                LOG.error(msg)
                 raise n_exc.Invalid(msg)
 
     def add_provider(self, provider):
@@ -151,7 +218,7 @@ class ProviderConfiguration(object):
         if provider_type in self.providers:
             msg = (_("Multiple providers specified for service "
                      "%s") % provider['service_type'])
-            LOG.exception(msg)
+            LOG.error(msg)
             raise n_exc.Invalid(msg)
         self.providers[provider_type] = {'driver': provider['driver'],
                                          'default': provider['default']}

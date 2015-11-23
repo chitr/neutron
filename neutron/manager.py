@@ -15,17 +15,15 @@
 
 import weakref
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging
+from oslo_service import periodic_task
+import six
 
 from neutron.common import utils
-from neutron.i18n import _LE, _LI
-from neutron.openstack.common import log as logging
-from neutron.openstack.common import periodic_task
+from neutron.i18n import _LI
 from neutron.plugins.common import constants
-
-from stevedore import driver
 
 
 LOG = logging.getLogger(__name__)
@@ -36,13 +34,14 @@ CORE_PLUGINS_NAMESPACE = 'neutron.core_plugins'
 class Manager(periodic_task.PeriodicTasks):
 
     # Set RPC API version to 1.0 by default.
-    target = messaging.Target(version='1.0')
+    target = oslo_messaging.Target(version='1.0')
 
     def __init__(self, host=None):
         if not host:
             host = cfg.CONF.host
         self.host = host
-        super(Manager, self).__init__()
+        conf = getattr(self, "conf", cfg.CONF)
+        super(Manager, self).__init__(conf)
 
     def periodic_tasks(self, context, raise_on_error=False):
         self.run_periodic_tasks(context, raise_on_error=raise_on_error)
@@ -126,20 +125,27 @@ class NeutronManager(object):
         # the rest of service plugins
         self.service_plugins = {constants.CORE: self.plugin}
         self._load_service_plugins()
+        # Used by pecan WSGI
+        self.resource_plugin_mappings = {}
+        self.resource_controller_mappings = {}
+
+    @staticmethod
+    def load_class_for_provider(namespace, plugin_provider):
+        """Loads plugin using alias or class name
+        :param namespace: namespace where alias is defined
+        :param plugin_provider: plugin alias or class name
+        :returns plugin that is loaded
+        :raises ImportError if fails to load plugin
+        """
+
+        try:
+            return utils.load_class_by_alias_or_classname(namespace,
+                    plugin_provider)
+        except ImportError:
+            raise ImportError(_("Plugin '%s' not found.") % plugin_provider)
 
     def _get_plugin_instance(self, namespace, plugin_provider):
-        try:
-            # Try to resolve plugin by name
-            mgr = driver.DriverManager(namespace, plugin_provider)
-            plugin_class = mgr.driver
-        except RuntimeError as e1:
-            # fallback to class name
-            try:
-                plugin_class = importutils.import_class(plugin_provider)
-            except ImportError as e2:
-                LOG.exception(_LE("Error loading plugin by name, %s"), e1)
-                LOG.exception(_LE("Error loading plugin by class, %s"), e2)
-                raise ImportError(_("Plugin not found."))
+        plugin_class = self.load_class_for_provider(namespace, plugin_provider)
         return plugin_class()
 
     def _load_services_from_core_plugin(self):
@@ -224,5 +230,27 @@ class NeutronManager(object):
     @classmethod
     def get_service_plugins(cls):
         # Return weakrefs to minimize gc-preventing references.
+        service_plugins = cls.get_instance().service_plugins
         return dict((x, weakref.proxy(y))
-                    for x, y in cls.get_instance().service_plugins.iteritems())
+                    for x, y in six.iteritems(service_plugins))
+
+    @classmethod
+    def get_unique_service_plugins(cls):
+        service_plugins = cls.get_instance().service_plugins
+        return tuple(weakref.proxy(x) for x in set(service_plugins.values()))
+
+    @classmethod
+    def set_plugin_for_resource(cls, resource, plugin):
+        cls.get_instance().resource_plugin_mappings[resource] = plugin
+
+    @classmethod
+    def get_plugin_for_resource(cls, resource):
+        return cls.get_instance().resource_plugin_mappings.get(resource)
+
+    @classmethod
+    def set_controller_for_resource(cls, resource, controller):
+        cls.get_instance().resource_controller_mappings[resource] = controller
+
+    @classmethod
+    def get_controller_for_resource(cls, resource):
+        return cls.get_instance().resource_controller_mappings.get(resource)

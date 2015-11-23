@@ -38,6 +38,8 @@ internal_edge_purpose_enum = sa.Enum('inter_edge_net',
                                      name='nsxv_internal_edges_purpose')
 tz_binding_type_enum = sa.Enum('flat', 'vlan', 'portgroup',
                                name='nsxv_tz_network_bindings_binding_type')
+router_types_enum = sa.Enum('shared', 'exclusive',
+                            name='nsxv_router_type')
 
 
 def upgrade():
@@ -57,14 +59,14 @@ def upgrade():
         'nsxv_internal_networks',
         sa.Column('network_purpose', internal_network_purpose_enum,
                   nullable=False),
-        sa.Column('network_id', sa.String(length=36), nullable=False),
+        sa.Column('network_id', sa.String(length=36), nullable=True),
         sa.ForeignKeyConstraint(['network_id'], ['networks.id'],
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('network_purpose'))
     op.create_table(
         'nsxv_internal_edges',
         sa.Column('ext_ip_address', sa.String(length=64), nullable=False),
-        sa.Column('router_id', sa.String(length=36), nullable=False),
+        sa.Column('router_id', sa.String(length=36), nullable=True),
         sa.Column('purpose', internal_edge_purpose_enum, nullable=True),
         sa.PrimaryKeyConstraint('ext_ip_address'))
     op.create_table(
@@ -138,29 +140,9 @@ def upgrade():
         'nsxv_router_ext_attributes',
         sa.Column('router_id', sa.String(length=36), nullable=False),
         sa.Column('distributed', sa.Boolean(), nullable=False),
-        sa.Column('exclusive', sa.Boolean(), nullable=False),
+        sa.Column('router_type', router_types_enum,
+                  default='exclusive', nullable=False),
         sa.Column('service_router', sa.Boolean(), nullable=False),
         sa.ForeignKeyConstraint(['router_id'], ['routers.id'],
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('router_id'))
-
-
-def downgrade():
-    op.drop_table('nsxv_router_ext_attributes')
-    op.drop_table('nsxv_rule_mappings')
-    op.drop_table('nsxv_port_index_mappings')
-    op.drop_table('nsxv_port_vnic_mappings')
-    op.drop_table('nsxv_tz_network_bindings')
-    op.drop_table('nsxv_security_group_section_mappings')
-    op.drop_table('nsxv_spoofguard_policy_network_mappings')
-    op.drop_table('nsxv_edge_vnic_bindings')
-    op.drop_table('nsxv_edge_dhcp_static_bindings')
-    op.drop_table('nsxv_firewall_rule_bindings')
-    op.drop_table('nsxv_internal_edges')
-    op.drop_table('nsxv_internal_networks')
-    op.drop_table('nsxv_router_bindings')
-    appliance_sizes_enum.drop(op.get_bind(), checkfirst=False)
-    edge_types_enum.drop(op.get_bind(), checkfirst=False)
-    internal_network_purpose_enum.drop(op.get_bind(), checkfirst=False)
-    internal_edge_purpose_enum.drop(op.get_bind(), checkfirst=False)
-    tz_binding_type_enum.drop(op.get_bind(), checkfirst=False)

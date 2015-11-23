@@ -13,23 +13,19 @@
 #    under the License.
 
 import eventlet
-import fixtures
-
-from six import moves
 
 from neutron.agent.linux import async_process
 from neutron.agent.linux import utils
 from neutron.tests import base
 
 
-class TestAsyncProcess(base.BaseTestCase):
+class AsyncProcessTestFramework(base.BaseTestCase):
 
     def setUp(self):
-        super(TestAsyncProcess, self).setUp()
-        self.test_file_path = self.useFixture(
-            fixtures.TempDir()).join("test_async_process.tmp")
-        self.data = [str(x) for x in moves.xrange(4)]
-        with file(self.test_file_path, 'w') as f:
+        super(AsyncProcessTestFramework, self).setUp()
+        self.test_file_path = self.get_temp_file_path('test_async_process.tmp')
+        self.data = [str(x) for x in range(4)]
+        with open(self.test_file_path, 'w') as f:
             f.writelines('%s\n' % item for item in self.data)
 
     def _check_stdout(self, proc):
@@ -41,12 +37,21 @@ class TestAsyncProcess(base.BaseTestCase):
                 output += new_output
             eventlet.sleep(0.01)
 
+
+class TestAsyncProcess(AsyncProcessTestFramework):
+    def _safe_stop(self, proc):
+        try:
+            proc.stop()
+        except async_process.AsyncProcessException:
+            pass
+
     def test_stopping_async_process_lifecycle(self):
         proc = async_process.AsyncProcess(['tail', '-f',
                                            self.test_file_path])
-        proc.start()
+        self.addCleanup(self._safe_stop, proc)
+        proc.start(block=True)
         self._check_stdout(proc)
-        proc.stop()
+        proc.stop(block=True)
 
         # Ensure that the process and greenthreads have stopped
         proc._process.wait()
@@ -58,12 +63,16 @@ class TestAsyncProcess(base.BaseTestCase):
         proc = async_process.AsyncProcess(['tail', '-f',
                                            self.test_file_path],
                                           respawn_interval=0)
+        self.addCleanup(self._safe_stop, proc)
         proc.start()
 
         # Ensure that the same output is read twice
         self._check_stdout(proc)
-        pid = utils.get_root_helper_child_pid(proc._process.pid,
-                                              proc.root_helper)
-        proc._kill_process(pid)
+        pid = proc.pid
+        utils.execute(['kill', '-9', pid])
+        utils.wait_until_true(
+            lambda: proc.is_active() and pid != proc.pid,
+            timeout=5,
+            sleep=0.01,
+            exception=RuntimeError(_("Async process didn't respawn")))
         self._check_stdout(proc)
-        proc.stop()

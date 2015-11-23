@@ -90,6 +90,8 @@ TYPE := { vlan | veth | vcan | dummy | ifb | macvlan | macvtap |
 TYPE := { vlan | veth | vcan | dummy | ifb | macvlan | can }
     """
 
+    IP_LINK_HELP_NO_SPOOFCHK = IP_LINK_HELP_NO_STATE
+
     IP_LINK_HELP_NO_VF = """Usage: ip link set DEVICE { up | down |
                              arp { on | off } |
                              dynamic { on | off } |
@@ -114,7 +116,6 @@ TYPE := { vlan | veth | vcan | dummy | ifb | macvlan | can }
                 vf_section, capability, subcapability)
             self.assertEqual(expected, capable)
             mock_exec.assert_called_once_with(['ip', 'link', 'help'],
-                                              None,
                                               check_exit_code=False,
                                               return_stderr=True,
                                               log_fail_as_error=False)
@@ -134,6 +135,12 @@ TYPE := { vlan | veth | vcan | dummy | ifb | macvlan | can }
             ip_link.IpLinkConstants.IP_LINK_CAPABILITY_STATE,
             expected=False,
             stderr=self.IP_LINK_HELP_NO_STATE)
+
+    def test_vf_mgmt_no_spoofchk(self):
+        self._test_capability(
+            ip_link.IpLinkConstants.IP_LINK_CAPABILITY_SPOOFCHK,
+            expected=False,
+            stderr=self.IP_LINK_HELP_NO_SPOOFCHK)
 
     def test_vf_mgmt_no_vf(self):
         self._test_capability(

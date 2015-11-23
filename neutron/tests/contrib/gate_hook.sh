@@ -1,65 +1,46 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -ex
 
-venv=${1:-"dsvm-functional"}
+VENV=${1:-"dsvm-functional"}
 
-CONTRIB_DIR="$BASE/new/neutron/neutron/tests/contrib"
+GATE_DEST=$BASE/new
+DEVSTACK_PATH=$GATE_DEST/devstack
 
-if [ "$venv" == "dsvm-functional" ]
+if [ "$VENV" == "dsvm-functional" ] || [ "$VENV" == "dsvm-fullstack" ]
 then
+    # The following need to be set before sourcing
+    # configure_for_func_testing.
+    GATE_STACK_USER=stack
+    NEUTRON_PATH=$GATE_DEST/neutron
+    PROJECT_NAME=neutron
+    IS_GATE=True
+
+    source $NEUTRON_PATH/tools/configure_for_func_testing.sh
+
+    # Make the workspace owned by the stack user
+    sudo chown -R $STACK_USER:$STACK_USER $BASE
+
+    configure_host_for_func_testing
+elif [ "$VENV" == "api" ]
+then
+    cat > $DEVSTACK_PATH/local.conf <<EOF
+[[post-config|/etc/neutron/neutron_lbaas.conf]]
+
+[service_providers]
+service_provider=LOADBALANCER:Haproxy:neutron_lbaas.services.loadbalancer.drivers.haproxy.plugin_driver.HaproxyOnHostPluginDriver:default
+
+[[post-config|/etc/neutron/neutron_vpnaas.conf]]
+
+[service_providers]
+service_provider=VPN:openswan:neutron_vpnaas.services.vpn.service_drivers.ipsec.IPsecVPNDriver:default
+
+EOF
+
+    export DEVSTACK_LOCAL_CONFIG+="
+enable_plugin neutron-vpnaas git://git.openstack.org/openstack/neutron-vpnaas
+enable_plugin neutron git://git.openstack.org/openstack/neutron
+"
+
     $BASE/new/devstack-gate/devstack-vm-gate.sh
-
-    # Add a rootwrap filter to support test-only
-    # configuration (e.g. a KillFilter for processes that
-    # use the python installed in a tox env).
-    FUNC_FILTER=$CONTRIB_DIR/filters.template
-    sed -e "s+\$BASE_PATH+$BASE/new/neutron/.tox/dsvm-functional+" \
-        $FUNC_FILTER | sudo tee /etc/neutron/rootwrap.d/functional.filters > /dev/null
-
-    # Use devstack functions to install mysql and psql servers
-    TOP_DIR=$BASE/new/devstack
-    source $TOP_DIR/functions
-    source $TOP_DIR/lib/config
-    source $TOP_DIR/stackrc
-    source $TOP_DIR/lib/database
-    source $TOP_DIR/localrc
-
-    disable_service postgresql
-    enable_service mysql
-    initialize_database_backends
-    install_database
-
-    disable_service mysql
-    enable_service postgresql
-    initialize_database_backends
-    install_database
-
-    # Set up the 'openstack_citest' user and database in each backend
-    tmp_dir=`mktemp -d`
-
-    cat << EOF > $tmp_dir/mysql.sql
-CREATE DATABASE openstack_citest;
-CREATE USER 'openstack_citest'@'localhost' IDENTIFIED BY 'openstack_citest';
-CREATE USER 'openstack_citest' IDENTIFIED BY 'openstack_citest';
-GRANT ALL PRIVILEGES ON *.* TO 'openstack_citest'@'localhost';
-GRANT ALL PRIVILEGES ON *.* TO 'openstack_citest';
-FLUSH PRIVILEGES;
-EOF
-    /usr/bin/mysql -u root < $tmp_dir/mysql.sql
-
-    cat << EOF > $tmp_dir/postgresql.sql
-CREATE USER openstack_citest WITH CREATEDB LOGIN PASSWORD 'openstack_citest';
-CREATE DATABASE openstack_citest WITH OWNER openstack_citest;
-EOF
-    # User/group postgres needs to be given access to tmp_dir
-    setfacl -m g:postgres:rwx $tmp_dir
-    sudo -u postgres /usr/bin/psql --file=$tmp_dir/postgresql.sql
-elif [ "$venv" == "api" ]
-then
-    # TODO(armax): call devstack-vm-gate and set variables the proper way
-    export DEVSTACK_GATE_TEMPEST="1"
-    export DEVSTACK_GATE_TEMPEST_INSTALL_ONLY="1"
-
-    $CONTRIB_DIR/devstack-vm-gate.sh
 fi

@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from oslo_log import helpers as log_helpers
+from oslo_log import log as logging
+
 from neutron.common import constants as n_const
-from neutron.common import log
 from neutron.extensions import portbindings
 from neutron.i18n import _LI
-from neutron.openstack.common import log as logging
 from neutron.plugins.common import constants
 from neutron.plugins.ml2 import driver_api as api
 from neutron.plugins.ml2.drivers.freescale import config  # noqa
@@ -30,7 +31,7 @@ class FslsdnMechanismDriver(api.MechanismDriver):
 
     """Freescale SDN OS Mechanism Driver for ML2 Plugin."""
 
-    @log.log
+    @log_helpers.log_method_call
     def initialize(self):
         """Initialize the Mechanism driver."""
 
@@ -41,7 +42,7 @@ class FslsdnMechanismDriver(api.MechanismDriver):
 
     # Network Management
     @staticmethod
-    @log.log
+    @log_helpers.log_method_call
     def _prepare_crd_network(network, segments):
         """Helper function to create 'network' data."""
 
@@ -136,7 +137,7 @@ class FslsdnMechanismDriver(api.MechanismDriver):
 
     # Subnet Management
     @staticmethod
-    @log.log
+    @log_helpers.log_method_call
     def _prepare_crd_subnet(subnet):
         """Helper function to prepare 'subnet' data."""
 
@@ -202,7 +203,7 @@ class FslsdnMechanismDriver(api.MechanismDriver):
                   {'port': context.current['id'],
                    'network': context.network.current['id']})
         # Prepared porting binding data
-        for segment in context.network.network_segments:
+        for segment in context.segments_to_bind:
             if self.check_segment(segment):
                 context.set_binding(segment[api.ID],
                                     self.vif_type,
@@ -219,7 +220,7 @@ class FslsdnMechanismDriver(api.MechanismDriver):
                            'physnet': segment[api.PHYSICAL_NETWORK],
                            'nettype': segment[api.NETWORK_TYPE]})
 
-    @log.log
+    @log_helpers.log_method_call
     def check_segment(self, segment):
         """Verify a segment is valid for the FSL SDN MechanismDriver."""
 

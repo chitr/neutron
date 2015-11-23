@@ -15,14 +15,14 @@
 
 import abc
 
-from oslo.utils import excutils
-from oslo.utils import importutils
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import importutils
 import six
 
 from neutron.api import extensions
 from neutron.db import servicetype_db as sdb
 from neutron.i18n import _LE, _LI
-from neutron.openstack.common import log as logging
 from neutron.services import provider_configuration as pconf
 
 LOG = logging.getLogger(__name__)
@@ -42,18 +42,13 @@ class ServicePluginBase(extensions.PluginInterface):
         pass
 
     @abc.abstractmethod
-    def get_plugin_name(self):
-        """Return a symbolic name for the plugin.
-
-        Each service plugin should have a symbolic name. This name
-        will be used, for instance, by service definitions in service types
-        """
-        pass
-
-    @abc.abstractmethod
     def get_plugin_description(self):
         """Return string description of the plugin."""
         pass
+
+    def get_workers(self):
+        """Returns a collection of NeutronWorkers"""
+        return ()
 
 
 def load_drivers(service_type, plugin):

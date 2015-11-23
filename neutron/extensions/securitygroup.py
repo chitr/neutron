@@ -16,7 +16,8 @@
 import abc
 import netaddr
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_utils import uuidutils
 import six
 
 from neutron.api import extensions
@@ -25,8 +26,7 @@ from neutron.api.v2 import base
 from neutron.common import constants as const
 from neutron.common import exceptions as nexception
 from neutron import manager
-from neutron.openstack.common import uuidutils
-from neutron import quota
+from neutron.quota import resource_registry
 
 
 # Security group Exceptions
@@ -44,13 +44,23 @@ class SecurityGroupInvalidIcmpValue(nexception.InvalidInput):
                 "%(value)s. It must be 0 to 255.")
 
 
+class SecurityGroupEthertypeConflictWithProtocol(nexception.InvalidInput):
+    message = _("Invalid ethertype %(ethertype)s for protocol "
+                "%(protocol)s.")
+
+
 class SecurityGroupMissingIcmpType(nexception.InvalidInput):
     message = _("ICMP code (port-range-max) %(value)s is provided"
                 " but ICMP type (port-range-min) is missing.")
 
 
 class SecurityGroupInUse(nexception.InUse):
-    message = _("Security Group %(id)s in use.")
+    message = _("Security Group %(id)s %(reason)s.")
+
+    def __init__(self, **kwargs):
+        if 'reason' not in kwargs:
+            kwargs['reason'] = _("in use")
+        super(SecurityGroupInUse, self).__init__(**kwargs)
 
 
 class SecurityGroupCannotRemoveDefault(nexception.InUse):
@@ -67,8 +77,8 @@ class SecurityGroupDefaultAlreadyExists(nexception.InUse):
 
 class SecurityGroupRuleInvalidProtocol(nexception.InvalidInput):
     message = _("Security group rule protocol %(protocol)s not supported. "
-                "Only protocol values %(values)s and their integer "
-                "representation (0 to 255) are supported.")
+                "Only protocol values %(values)s and integer representations "
+                "[0 to 255] are supported.")
 
 
 class SecurityGroupRulesNotSingleTenant(nexception.InvalidInput):
@@ -106,8 +116,21 @@ class SecurityGroupRuleExists(nexception.InUse):
     message = _("Security group rule already exists. Rule id is %(id)s.")
 
 
+class SecurityGroupRuleInUse(nexception.InUse):
+    message = _("Security Group Rule %(id)s %(reason)s.")
+
+    def __init__(self, **kwargs):
+        if 'reason' not in kwargs:
+            kwargs['reason'] = _("in use")
+        super(SecurityGroupRuleInUse, self).__init__(**kwargs)
+
+
 class SecurityGroupRuleParameterConflict(nexception.InvalidInput):
     message = _("Conflicting value ethertype %(ethertype)s for CIDR %(cidr)s")
+
+
+class SecurityGroupConflict(nexception.Conflict):
+    message = _("Error %(reason)s while attempting the operation.")
 
 
 def convert_protocol(value):
@@ -133,7 +156,7 @@ def convert_protocol(value):
 
 
 def convert_ethertype_to_case_insensitive(value):
-    if isinstance(value, basestring):
+    if isinstance(value, six.string_types):
         for ethertype in sg_supported_ethertypes:
             if ethertype.lower() == value.lower():
                 return ethertype
@@ -180,8 +203,8 @@ def _validate_name_not_default(data, valid_values=None):
 
 attr.validators['type:name_not_default'] = _validate_name_not_default
 
-sg_supported_protocols = [None, const.PROTO_NAME_TCP,
-                          const.PROTO_NAME_UDP, const.PROTO_NAME_ICMP]
+sg_supported_protocols = [None, const.PROTO_NAME_TCP, const.PROTO_NAME_UDP,
+                          const.PROTO_NAME_ICMP, const.PROTO_NAME_ICMP_V6]
 sg_supported_ethertypes = ['IPv4', 'IPv6']
 
 # Attribute Map
@@ -193,11 +216,13 @@ RESOURCE_ATTRIBUTE_MAP = {
                'primary_key': True},
         'name': {'allow_post': True, 'allow_put': True,
                  'is_visible': True, 'default': '',
-                 'validate': {'type:name_not_default': None}},
+                 'validate': {'type:name_not_default': attr.NAME_MAX_LEN}},
         'description': {'allow_post': True, 'allow_put': True,
+                        'validate': {'type:string': attr.DESCRIPTION_MAX_LEN},
                         'is_visible': True, 'default': ''},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': True,
+                      'validate': {'type:string': attr.TENANT_ID_MAX_LEN},
                       'is_visible': True},
         'security_group_rules': {'allow_post': False, 'allow_put': False,
                                  'is_visible': True},
@@ -232,6 +257,7 @@ RESOURCE_ATTRIBUTE_MAP = {
                              'convert_to': convert_ip_prefix_to_cidr},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': True,
+                      'validate': {'type:string': attr.TENANT_ID_MAX_LEN},
                       'is_visible': True},
     }
 }
@@ -273,11 +299,6 @@ class Securitygroup(extensions.ExtensionDescriptor):
         return "The security groups extension."
 
     @classmethod
-    def get_namespace(cls):
-        # todo
-        return "http://docs.openstack.org/ext/securitygroups/api/v2.0"
-
-    @classmethod
     def get_updated(cls):
         return "2012-10-05T10:00:00-00:00"
 
@@ -291,7 +312,7 @@ class Securitygroup(extensions.ExtensionDescriptor):
         for resource_name in ['security_group', 'security_group_rule']:
             collection_name = resource_name.replace('_', '-') + "s"
             params = RESOURCE_ATTRIBUTE_MAP.get(resource_name + "s", dict())
-            quota.QUOTAS.register_resource_by_name(resource_name)
+            resource_registry.register_resource_by_name(resource_name)
             controller = base.create_resource(collection_name,
                                               resource_name,
                                               plugin, params, allow_bulk=True,
@@ -307,8 +328,8 @@ class Securitygroup(extensions.ExtensionDescriptor):
 
     def get_extended_resources(self, version):
         if version == "2.0":
-            return dict(EXTENDED_ATTRIBUTES_2_0.items() +
-                        RESOURCE_ATTRIBUTE_MAP.items())
+            return dict(list(EXTENDED_ATTRIBUTES_2_0.items()) +
+                        list(RESOURCE_ATTRIBUTE_MAP.items()))
         else:
             return {}
 

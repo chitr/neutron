@@ -13,24 +13,29 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import helpers as log_helpers
+from oslo_utils import importutils
 
 from neutron.api.rpc.agentnotifiers import l3_rpc_agent_api
 from neutron.api.rpc.handlers import l3_rpc
-from neutron.common import constants as q_const
+from neutron.common import constants as n_const
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron.db import common_db_mixin
 from neutron.db import extraroute_db
+from neutron.db import l3_db
 from neutron.db import l3_dvrscheduler_db
 from neutron.db import l3_gwmode_db
 from neutron.db import l3_hamode_db
 from neutron.db import l3_hascheduler_db
 from neutron.plugins.common import constants
+from neutron.quota import resource_registry
+from neutron.services import service_base
 
 
-class L3RouterPlugin(common_db_mixin.CommonDbMixin,
+class L3RouterPlugin(service_base.ServicePluginBase,
+                     common_db_mixin.CommonDbMixin,
                      extraroute_db.ExtraRoute_db_mixin,
                      l3_hamode_db.L3_HA_NAT_db_mixin,
                      l3_gwmode_db.L3_NAT_db_mixin,
@@ -50,23 +55,29 @@ class L3RouterPlugin(common_db_mixin.CommonDbMixin,
                                    "extraroute", "l3_agent_scheduler",
                                    "l3-ha"]
 
+    @resource_registry.tracked_resources(router=l3_db.Router,
+                                         floatingip=l3_db.FloatingIP)
     def __init__(self):
-        self.setup_rpc()
         self.router_scheduler = importutils.import_object(
             cfg.CONF.router_scheduler_driver)
-        self.start_periodic_agent_status_check()
+        self.start_periodic_l3_agent_status_check()
         super(L3RouterPlugin, self).__init__()
+        if 'dvr' in self.supported_extension_aliases:
+            l3_dvrscheduler_db.subscribe()
+        l3_db.subscribe()
+        self.start_rpc_listeners()
 
-    def setup_rpc(self):
+    @log_helpers.log_method_call
+    def start_rpc_listeners(self):
         # RPC support
         self.topic = topics.L3PLUGIN
-        self.conn = n_rpc.create_connection(new=True)
+        self.conn = n_rpc.create_connection()
         self.agent_notifiers.update(
-            {q_const.AGENT_TYPE_L3: l3_rpc_agent_api.L3AgentNotifyAPI()})
+            {n_const.AGENT_TYPE_L3: l3_rpc_agent_api.L3AgentNotifyAPI()})
         self.endpoints = [l3_rpc.L3RpcCallback()]
         self.conn.create_consumer(self.topic, self.endpoints,
                                   fanout=False)
-        self.conn.consume_in_threads()
+        return self.conn.consume_in_threads()
 
     def get_plugin_type(self):
         return constants.L3_ROUTER_NAT
@@ -90,4 +101,4 @@ class L3RouterPlugin(common_db_mixin.CommonDbMixin,
         """
         return super(L3RouterPlugin, self).create_floatingip(
             context, floatingip,
-            initial_status=q_const.FLOATINGIP_STATUS_DOWN)
+            initial_status=n_const.FLOATINGIP_STATUS_DOWN)

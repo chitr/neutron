@@ -17,12 +17,12 @@
 # TODO(shiv) need support for security groups
 
 
-"""Implentation of Brocade Neutron Plugin."""
+"""Implementation of Brocade Neutron Plugin."""
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import importutils
-from oslo_context import context as oslo_context
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging
+from oslo_utils import importutils
 
 from neutron.agent import securitygroups_rpc as sg_rpc
 from neutron.api.rpc.agentnotifiers import dhcp_rpc_agent_api
@@ -31,10 +31,11 @@ from neutron.api.rpc.handlers import dhcp_rpc
 from neutron.api.rpc.handlers import l3_rpc
 from neutron.api.rpc.handlers import metadata_rpc
 from neutron.api.rpc.handlers import securitygroups_rpc
-from neutron.common import constants as q_const
+from neutron.common import constants as n_const
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron.common import utils
+from neutron import context as n_context
 from neutron.db import agents_db
 from neutron.db import agentschedulers_db
 from neutron.db import api as db
@@ -47,14 +48,12 @@ from neutron.db import securitygroups_rpc_base as sg_db_rpc
 from neutron.extensions import portbindings
 from neutron.extensions import securitygroup as ext_sg
 from neutron.i18n import _LE, _LI
-from neutron.openstack.common import log as logging
 from neutron.plugins.brocade.db import models as brocade_db
 from neutron.plugins.brocade import vlanbm as vbm
 from neutron.plugins.common import constants as svc_constants
 
 
 LOG = logging.getLogger(__name__)
-PLUGIN_VERSION = 0.88
 AGENT_OWNER_PREFIX = "network:"
 NOS_DRIVER = 'neutron.plugins.brocade.nos.nosdriver.NOSdriver'
 
@@ -80,7 +79,7 @@ cfg.CONF.register_opts(PHYSICAL_INTERFACE_OPTS, "PHYSICAL_INTERFACE")
 class BridgeRpcCallbacks(object):
     """Agent callback."""
 
-    target = messaging.Target(version='1.2')
+    target = oslo_messaging.Target(version='1.2')
     # Device names start with "tap"
     # history
     #   1.1 Support Security Group RPC
@@ -94,7 +93,7 @@ class BridgeRpcCallbacks(object):
         LOG.debug("Device %(device)s details requested from %(agent_id)s",
                   {'device': device, 'agent_id': agent_id})
         port = brocade_db.get_port(rpc_context,
-                                   device[len(q_const.TAP_DEVICE_PREFIX):])
+                                   device[len(n_const.TAP_DEVICE_PREFIX):])
         if port:
             entry = {'device': device,
                      'vlan_id': port.vlan_id,
@@ -154,7 +153,7 @@ class SecurityGroupServerRpcMixin(sg_db_rpc.SecurityGroupServerRpcMixin):
         # Doing what other plugins are doing
         session = db.get_session()
         port = brocade_db.get_port_from_device(
-            session, device[len(q_const.TAP_DEVICE_PREFIX):])
+            session, device[len(n_const.TAP_DEVICE_PREFIX):])
 
         # TODO(shiv): need to extend the db model to include device owners
         # make it appears that the device owner is of type network
@@ -177,7 +176,7 @@ class AgentNotifierApi(sg_rpc.SecurityGroupAgentRpcApiMixin):
 
     def __init__(self, topic):
         self.topic = topic
-        target = messaging.Target(topic=topic, version='1.0')
+        target = oslo_messaging.Target(topic=topic, version='1.0')
         self.client = n_rpc.get_client(target)
         self.topic_network_delete = topics.get_topic_name(topic,
                                                           topics.NETWORK,
@@ -228,8 +227,7 @@ class BrocadePluginV2(db_base_plugin_v2.NeutronDbPluginV2,
                                    physical_interface)
         self.base_binding_dict = self._get_base_binding_dict()
         portbindings_base.register_port_dict_function()
-        self.ctxt = oslo_context.get_admin_context()
-        self.ctxt.session = db.get_session()
+        self.ctxt = n_context.get_admin_context()
         self._vlan_bitmap = vbm.VlanBitmap(self.ctxt)
         self._setup_rpc()
         self.network_scheduler = importutils.import_object(
@@ -239,6 +237,7 @@ class BrocadePluginV2(db_base_plugin_v2.NeutronDbPluginV2,
             cfg.CONF.router_scheduler_driver
         )
         self.brocade_init()
+        self.start_periodic_dhcp_agent_status_check()
 
     def brocade_init(self):
         """Brocade specific initialization."""
@@ -253,9 +252,9 @@ class BrocadePluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         # RPC support
         self.service_topics = {svc_constants.CORE: topics.PLUGIN,
                                svc_constants.L3_ROUTER_NAT: topics.L3PLUGIN}
-        self.rpc_context = oslo_context.RequestContext('neutron', 'neutron',
-                                                  is_admin=False)
-        self.conn = n_rpc.create_connection(new=True)
+        self.rpc_context = n_context.ContextBase('neutron', 'neutron',
+                                                 is_admin=False)
+        self.conn = n_rpc.create_connection()
         self.endpoints = [BridgeRpcCallbacks(),
                           securitygroups_rpc.SecurityGroupServerRpcCallback(),
                           dhcp_rpc.DhcpRpcCallback(),
@@ -267,10 +266,10 @@ class BrocadePluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         # Consume from all consumers in threads
         self.conn.consume_in_threads()
         self.notifier = AgentNotifierApi(topics.AGENT)
-        self.agent_notifiers[q_const.AGENT_TYPE_DHCP] = (
+        self.agent_notifiers[n_const.AGENT_TYPE_DHCP] = (
             dhcp_rpc_agent_api.DhcpAgentNotifyAPI()
         )
-        self.agent_notifiers[q_const.AGENT_TYPE_L3] = (
+        self.agent_notifiers[n_const.AGENT_TYPE_L3] = (
             l3_rpc_agent_api.L3AgentNotifyAPI()
         )
 
@@ -480,10 +479,6 @@ class BrocadePluginV2(db_base_plugin_v2.NeutronDbPluginV2,
                 portbindings.CAP_PORT_FILTER:
                 'security-group' in self.supported_extension_aliases}}
         return binding
-
-    def get_plugin_version(self):
-        """Get version number of the plugin."""
-        return PLUGIN_VERSION
 
     @staticmethod
     def mac_reformat_62to34(interface_mac):

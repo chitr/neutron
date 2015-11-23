@@ -15,7 +15,7 @@
 
 import abc
 
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from neutron.api import extensions
 from neutron import wsgi
@@ -51,9 +51,6 @@ class Foxinsocks(object):
     def get_description(self):
         return "The Fox In Socks Extension"
 
-    def get_namespace(self):
-        return "http://www.fox.in.socks/api/ext/pie/v1.0"
-
     def get_updated(self):
         return "2011-01-22T13:25:27-06:00"
 
@@ -80,7 +77,7 @@ class Foxinsocks(object):
             # You can use content type header to test for XML.
             data = jsonutils.loads(res.body)
             data['FOXNSOX:googoose'] = req.GET.get('chewing')
-            res.body = jsonutils.dumps(data)
+            res.body = jsonutils.dumps(data).encode('utf-8')
             return res
 
         req_ext1 = extensions.RequestExtension('GET', '/dummy_resources/:(id)',
@@ -92,7 +89,7 @@ class Foxinsocks(object):
             # You can use content type header to test for XML.
             data = jsonutils.loads(res.body)
             data['FOXNSOX:big_bands'] = 'Pig Bands!'
-            res.body = jsonutils.dumps(data)
+            res.body = jsonutils.dumps(data).encode('utf-8')
             return res
 
         req_ext2 = extensions.RequestExtension('GET', '/dummy_resources/:(id)',

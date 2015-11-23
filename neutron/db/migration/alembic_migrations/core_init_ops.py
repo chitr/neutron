@@ -54,6 +54,14 @@ def upgrade():
         sa.Column('gateway_ip', sa.String(length=64), nullable=True),
         sa.Column('enable_dhcp', sa.Boolean(), nullable=True),
         sa.Column('shared', sa.Boolean(), nullable=True),
+        sa.Column('ipv6_ra_mode',
+                  sa.Enum('slaac', 'dhcpv6-stateful', 'dhcpv6-stateless',
+                          name='ipv6_ra_modes'),
+                  nullable=True),
+        sa.Column('ipv6_address_mode',
+                  sa.Enum('slaac', 'dhcpv6-stateful', 'dhcpv6-stateless',
+                          name='ipv6_address_modes'),
+                  nullable=True),
         sa.ForeignKeyConstraint(['network_id'], ['networks.id'], ),
         sa.PrimaryKeyConstraint('id'))
 
@@ -115,15 +123,3 @@ def upgrade():
         sa.ForeignKeyConstraint(['network_id'], ['networks.id'],
             ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('network_id', 'dhcp_agent_id'))
-
-
-def downgrade():
-    op.drop_table('networkdhcpagentbindings')
-    op.drop_table('ipavailabilityranges')
-    op.drop_table('ipallocations')
-    op.drop_table('subnetroutes')
-    op.drop_table('ipallocationpools')
-    op.drop_table('dnsnameservers')
-    op.drop_table('subnets')
-    op.drop_table('ports')
-    op.drop_table('networks')

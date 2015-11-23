@@ -14,13 +14,13 @@
 
 import abc
 
+from oslo_log import log as logging
 import six
 
 from neutron.api import extensions
 from neutron.api.v2 import attributes as attr
 from neutron.api.v2 import resource_helper
 from neutron.common import exceptions as nexception
-from neutron.openstack.common import log as logging
 from neutron.plugins.common import constants
 from neutron.services import service_base
 
@@ -55,6 +55,7 @@ RESOURCE_ATTRIBUTE_MAP = {
                         'is_visible': True, 'default': ''},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': True,
+                      'validate': {'type:string': attr.TENANT_ID_MAX_LEN},
                       'is_visible': True},
         'shared': {'allow_post': True, 'allow_put': False,
                    'is_visible': True, 'default': False,
@@ -78,6 +79,7 @@ RESOURCE_ATTRIBUTE_MAP = {
                              'validate': {'type:subnet': None}},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': True,
+                      'validate': {'type:string': attr.TENANT_ID_MAX_LEN},
                       'is_visible': True}
     }
 }
@@ -96,10 +98,6 @@ class Metering(extensions.ExtensionDescriptor):
     @classmethod
     def get_description(cls):
         return "Neutron Metering extension."
-
-    @classmethod
-    def get_namespace(cls):
-        return "http://wiki.openstack.org/wiki/Neutron/Metering/Bandwidth#API"
 
     @classmethod
     def get_updated(cls):
@@ -136,9 +134,6 @@ class Metering(extensions.ExtensionDescriptor):
 
 @six.add_metaclass(abc.ABCMeta)
 class MeteringPluginBase(service_base.ServicePluginBase):
-
-    def get_plugin_name(self):
-        return constants.METERING
 
     def get_plugin_description(self):
         return constants.METERING

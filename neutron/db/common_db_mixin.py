@@ -15,10 +15,32 @@
 
 import weakref
 
+import six
+from sqlalchemy import and_
+from sqlalchemy import or_
 from sqlalchemy import sql
 
 from neutron.common import exceptions as n_exc
 from neutron.db import sqlalchemyutils
+
+
+def model_query_scope(context, model):
+    # Unless a context has 'admin' or 'advanced-service' rights the
+    # query will be scoped to a single tenant_id
+    return ((not context.is_admin and hasattr(model, 'tenant_id')) and
+            (not context.is_advsvc and hasattr(model, 'tenant_id')))
+
+
+def model_query(context, model):
+    query = context.session.query(model)
+    # define basic filter condition for model query
+    query_filter = None
+    if model_query_scope(context, model):
+        query_filter = (model.tenant_id == context.tenant_id)
+
+    if query_filter is not None:
+        query = query.filter(query_filter)
+    return query
 
 
 class CommonDbMixin(object):
@@ -71,33 +93,65 @@ class CommonDbMixin(object):
         return weakref.proxy(self)
 
     def model_query_scope(self, context, model):
-        # NOTE(jkoelker) non-admin queries are scoped to their tenant_id
-        # NOTE(salvatore-orlando): unless the model allows for shared objects
-        # NOTE(mestery): Or the user has the advsvc role
-        return ((not context.is_admin and hasattr(model, 'tenant_id')) and
-                (not context.is_advsvc and hasattr(model, 'tenant_id')))
+        return model_query_scope(context, model)
 
     def _model_query(self, context, model):
+        if isinstance(model, UnionModel):
+            return self._union_model_query(context, model)
+        else:
+            return self._single_model_query(context, model)
+
+    def _union_model_query(self, context, model):
+        # A union query is a query that combines multiple sets of data
+        # together and represents them as one. So if a UnionModel was
+        # passed in, we generate the query for each model with the
+        # appropriate filters and then combine them together with the
+        # .union operator. This allows any subsequent users of the query
+        # to handle it like a normal query (e.g. add pagination/sorting/etc)
+        first_query = None
+        remaining_queries = []
+        for name, component_model in model.model_map.items():
+            query = self._single_model_query(context, component_model)
+            if model.column_type_name:
+                query.add_columns(
+                    sql.expression.column('"%s"' % name, is_literal=True).
+                    label(model.column_type_name)
+                )
+            if first_query is None:
+                first_query = query
+            else:
+                remaining_queries.append(query)
+        return first_query.union(*remaining_queries)
+
+    def _single_model_query(self, context, model):
         query = context.session.query(model)
         # define basic filter condition for model query
         query_filter = None
         if self.model_query_scope(context, model):
-            if hasattr(model, 'shared'):
+            if hasattr(model, 'rbac_entries'):
+                query = query.outerjoin(model.rbac_entries)
+                rbac_model = model.rbac_entries.property.mapper.class_
+                query_filter = (
+                    (model.tenant_id == context.tenant_id) |
+                    ((rbac_model.action == 'access_as_shared') &
+                     ((rbac_model.target_tenant == context.tenant_id) |
+                      (rbac_model.target_tenant == '*'))))
+            elif hasattr(model, 'shared'):
                 query_filter = ((model.tenant_id == context.tenant_id) |
                                 (model.shared == sql.true()))
             else:
                 query_filter = (model.tenant_id == context.tenant_id)
         # Execute query hooks registered from mixins and plugins
-        for _name, hooks in self._model_query_hooks.get(model,
-                                                        {}).iteritems():
+        for _name, hooks in six.iteritems(self._model_query_hooks.get(model,
+                                                                      {})):
             query_hook = hooks.get('query')
-            if isinstance(query_hook, basestring):
+            if isinstance(query_hook, six.string_types):
                 query_hook = getattr(self, query_hook, None)
             if query_hook:
                 query = query_hook(context, model, query)
 
             filter_hook = hooks.get('filter')
-            if isinstance(filter_hook, basestring):
+            if isinstance(filter_hook, six.string_types):
                 filter_hook = getattr(self, filter_hook, None)
             if filter_hook:
                 query_filter = filter_hook(context, model, query_filter)
@@ -129,16 +183,55 @@ class CommonDbMixin(object):
         query = self._model_query(context, model)
         return query.filter(model.id == id).one()
 
-    def _apply_filters_to_query(self, query, model, filters):
+    def _apply_filters_to_query(self, query, model, filters, context=None):
         if filters:
-            for key, value in filters.iteritems():
+            for key, value in six.iteritems(filters):
                 column = getattr(model, key, None)
-                if column:
+                # NOTE(kevinbenton): if column is a hybrid property that
+                # references another expression, attempting to convert to
+                # a boolean will fail so we must compare to None.
+                # See "An Important Expression Language Gotcha" in:
+                # docs.sqlalchemy.org/en/rel_0_9/changelog/migration_06.html
+                if column is not None:
+                    if not value:
+                        query = query.filter(sql.false())
+                        return query
                     query = query.filter(column.in_(value))
-            for _name, hooks in self._model_query_hooks.get(model,
-                                                            {}).iteritems():
+                elif key == 'shared' and hasattr(model, 'rbac_entries'):
+                    # translate a filter on shared into a query against the
+                    # object's rbac entries
+                    query = query.outerjoin(model.rbac_entries)
+                    rbac = model.rbac_entries.property.mapper.class_
+                    matches = [rbac.target_tenant == '*']
+                    if context:
+                        matches.append(rbac.target_tenant == context.tenant_id)
+                    # any 'access_as_shared' records that match the
+                    # wildcard or requesting tenant
+                    is_shared = and_(rbac.action == 'access_as_shared',
+                                     or_(*matches))
+                    if not value[0]:
+                        # NOTE(kevinbenton): we need to find objects that don't
+                        # have an entry that matches the criteria above so
+                        # we use a subquery to exclude them.
+                        # We can't just filter the inverse of the query above
+                        # because that will still give us a network shared to
+                        # our tenant (or wildcard) if it's shared to another
+                        # tenant.
+                        # This is the column joining the table to rbac via
+                        # the object_id. We can't just use model.id because
+                        # subnets join on network.id so we have to inspect the
+                        # relationship.
+                        join_cols = model.rbac_entries.property.local_columns
+                        oid_col = list(join_cols)[0]
+                        is_shared = ~oid_col.in_(
+                            query.session.query(rbac.object_id).
+                            filter(is_shared)
+                        )
+                    query = query.filter(is_shared)
+            for _nam, hooks in six.iteritems(self._model_query_hooks.get(model,
+                                                                         {})):
                 result_filter = hooks.get('result_filters', None)
-                if isinstance(result_filter, basestring):
+                if isinstance(result_filter, six.string_types):
                     result_filter = getattr(self, result_filter, None)
 
                 if result_filter:
@@ -150,7 +243,7 @@ class CommonDbMixin(object):
         for func in self._dict_extend_functions.get(
             resource_type, []):
             args = (response, db_object)
-            if isinstance(func, basestring):
+            if isinstance(func, six.string_types):
                 func = getattr(self, func, None)
             else:
                 # must call unbound method - use self as 1st argument
@@ -162,7 +255,8 @@ class CommonDbMixin(object):
                               sorts=None, limit=None, marker_obj=None,
                               page_reverse=False):
         collection = self._model_query(context, model)
-        collection = self._apply_filters_to_query(collection, model, filters)
+        collection = self._apply_filters_to_query(collection, model, filters,
+                                                  context)
         if limit and page_reverse and sorts:
             sorts = [(s[0], not s[1]) for s in sorts]
         collection = sqlalchemyutils.paginate_query(collection, model, limit,
@@ -197,4 +291,15 @@ class CommonDbMixin(object):
         """
         columns = [c.name for c in model.__table__.columns]
         return dict((k, v) for (k, v) in
-                    data.iteritems() if k in columns)
+                    six.iteritems(data) if k in columns)
+
+
+class UnionModel(object):
+    """Collection of models that _model_query can query as a single table."""
+
+    def __init__(self, model_map, column_type_name=None):
+        # model_map is a dictionary of models keyed by an arbitrary name.
+        # If column_type_name is specified, the resulting records will have a
+        # column with that name which identifies the source of each record
+        self.model_map = model_map
+        self.column_type_name = column_type_name

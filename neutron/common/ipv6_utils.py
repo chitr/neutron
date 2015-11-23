@@ -19,10 +19,10 @@ IPv6-related utilities and helper functions.
 import os
 
 import netaddr
+from oslo_log import log
 
 from neutron.common import constants
 from neutron.i18n import _LI
-from neutron.openstack.common import log
 
 
 LOG = log.getLogger(__name__)
@@ -69,3 +69,18 @@ def is_auto_address_subnet(subnet):
     modes = [constants.IPV6_SLAAC, constants.DHCPV6_STATELESS]
     return (subnet['ipv6_address_mode'] in modes
             or subnet['ipv6_ra_mode'] in modes)
+
+
+def is_eui64_address(ip_address):
+    """Check if ip address is EUI64."""
+    ip = netaddr.IPAddress(ip_address)
+    # '0xfffe' addition is used to build EUI-64 from MAC (RFC4291)
+    # Look for it in the middle of the EUI-64 part of address
+    return ip.version == 6 and not ((ip & 0xffff000000) ^ 0xfffe000000)
+
+
+def is_ipv6_pd_enabled(subnet):
+    """Returns True if the subnetpool_id of the given subnet is equal to
+       constants.IPV6_PD_POOL_ID
+    """
+    return subnet.get('subnetpool_id') == constants.IPV6_PD_POOL_ID

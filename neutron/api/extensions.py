@@ -1,5 +1,4 @@
 # Copyright 2011 OpenStack Foundation.
-# Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,11 +14,13 @@
 #    under the License.
 
 import abc
+import collections
 import imp
-import itertools
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_middleware import base
 import routes
 import six
 import webob.dec
@@ -29,7 +30,7 @@ from neutron.common import exceptions
 import neutron.extensions
 from neutron.i18n import _LE, _LI, _LW
 from neutron import manager
-from neutron.openstack.common import log as logging
+from neutron.services import provider_configuration
 from neutron import wsgi
 
 
@@ -61,12 +62,9 @@ class PluginInterface(object):
         return True
 
 
+@six.add_metaclass(abc.ABCMeta)
 class ExtensionDescriptor(object):
-    """Base class that defines the contract for extensions.
-
-    Note that you don't have to derive from this class to have a valid
-    extension; it is purely a convenience.
-    """
+    """Base class that defines the contract for extensions."""
 
     def get_name(self):
         """The name of the extension.
@@ -86,13 +84,6 @@ class ExtensionDescriptor(object):
         """Friendly description for the extension.
 
         e.g. 'The Fox In Socks Extension'
-        """
-        raise NotImplementedError()
-
-    def get_namespace(self):
-        """The XML namespace for the extension.
-
-        e.g. 'http://www.fox.in.socks/api/ext/pie/v1.0'
         """
         raise NotImplementedError()
 
@@ -168,22 +159,10 @@ class ExtensionDescriptor(object):
         if not extension_attrs_map:
             return
 
-        for resource, attrs in extension_attrs_map.iteritems():
+        for resource, attrs in six.iteritems(extension_attrs_map):
             extended_attrs = extended_attributes.get(resource)
             if extended_attrs:
                 attrs.update(extended_attrs)
-
-    def get_alias_namespace_compatibility_map(self):
-        """Returns mappings between extension aliases and XML namespaces.
-
-        The mappings are XML namespaces that should, for backward compatibility
-        reasons, be added to the XML serialization of extended attributes.
-        This allows an established extended attribute to be provided by
-        another extension than the original one while keeping its old alias
-        in the name.
-        :return: A dictionary of extension_aliases and namespace strings.
-        """
-        return {}
 
 
 class ActionExtensionController(wsgi.Controller):
@@ -198,7 +177,7 @@ class ActionExtensionController(wsgi.Controller):
     def action(self, request, id):
         input_dict = self._deserialize(request.body,
                                        request.get_content_type())
-        for action_name, handler in self.action_handlers.iteritems():
+        for action_name, handler in six.iteritems(self.action_handlers):
             if action_name in input_dict:
                 return handler(input_dict, request, id)
         # no action handler found (bump to downstream application)
@@ -228,19 +207,19 @@ class ExtensionController(wsgi.Controller):
     def __init__(self, extension_manager):
         self.extension_manager = extension_manager
 
-    def _translate(self, ext):
+    @staticmethod
+    def _translate(ext):
         ext_data = {}
         ext_data['name'] = ext.get_name()
         ext_data['alias'] = ext.get_alias()
         ext_data['description'] = ext.get_description()
-        ext_data['namespace'] = ext.get_namespace()
         ext_data['updated'] = ext.get_updated()
         ext_data['links'] = []  # TODO(dprince): implement extension links
         return ext_data
 
     def index(self, request):
         extensions = []
-        for _alias, ext in self.extension_manager.extensions.iteritems():
+        for _alias, ext in six.iteritems(self.extension_manager.extensions):
             extensions.append(self._translate(ext))
         return dict(extensions=extensions)
 
@@ -261,7 +240,7 @@ class ExtensionController(wsgi.Controller):
         raise webob.exc.HTTPNotFound(msg)
 
 
-class ExtensionMiddleware(wsgi.Middleware):
+class ExtensionMiddleware(base.ConfigurableMiddleware):
     """Extensions middleware for WSGI."""
 
     def __init__(self, application,
@@ -281,7 +260,7 @@ class ExtensionMiddleware(wsgi.Middleware):
 
             LOG.debug('Extended resource: %s',
                       resource.collection)
-            for action, method in resource.collection_actions.iteritems():
+            for action, method in six.iteritems(resource.collection_actions):
                 conditions = dict(method=[method])
                 path = "/%s/%s" % (resource.collection, action)
                 with mapper.submapper(controller=resource.controller,
@@ -409,7 +388,7 @@ class ExtensionManager(object):
         resources = []
         resources.append(ResourceExtension('extensions',
                                            ExtensionController(self)))
-        for ext in self.extensions.itervalues():
+        for ext in self.extensions.values():
             try:
                 resources.extend(ext.get_resources())
             except AttributeError:
@@ -421,7 +400,7 @@ class ExtensionManager(object):
     def get_actions(self):
         """Returns a list of ActionExtension objects."""
         actions = []
-        for ext in self.extensions.itervalues():
+        for ext in self.extensions.values():
             try:
                 actions.extend(ext.get_actions())
             except AttributeError:
@@ -433,7 +412,7 @@ class ExtensionManager(object):
     def get_request_extensions(self):
         """Returns a list of RequestExtension objects."""
         request_exts = []
-        for ext in self.extensions.itervalues():
+        for ext in self.extensions.values():
             try:
                 request_exts.extend(ext.get_request_extensions())
             except AttributeError:
@@ -458,7 +437,7 @@ class ExtensionManager(object):
         # is made in a whole iteration
         while exts_to_process:
             processed_ext_count = len(processed_exts)
-            for ext_name, ext in exts_to_process.items():
+            for ext_name, ext in list(exts_to_process.items()):
                 if not hasattr(ext, 'get_extended_resources'):
                     del exts_to_process[ext_name]
                     continue
@@ -472,11 +451,8 @@ class ExtensionManager(object):
                         continue
                 try:
                     extended_attrs = ext.get_extended_resources(version)
-                    for resource, resource_attrs in extended_attrs.iteritems():
-                        if attr_map.get(resource, None):
-                            attr_map[resource].update(resource_attrs)
-                        else:
-                            attr_map[resource] = resource_attrs
+                    for res, resource_attrs in six.iteritems(extended_attrs):
+                        attr_map.setdefault(res, {}).update(resource_attrs)
                 except AttributeError:
                     LOG.exception(_LE("Error fetching extended attributes for "
                                       "extension '%s'"), ext.get_name())
@@ -501,10 +477,9 @@ class ExtensionManager(object):
             LOG.debug('Ext name: %s', extension.get_name())
             LOG.debug('Ext alias: %s', extension.get_alias())
             LOG.debug('Ext description: %s', extension.get_description())
-            LOG.debug('Ext namespace: %s', extension.get_namespace())
             LOG.debug('Ext updated: %s', extension.get_updated())
-        except AttributeError as ex:
-            LOG.exception(_LE("Exception loading extension: %s"), unicode(ex))
+        except AttributeError:
+            LOG.exception(_LE("Exception loading extension"))
             return False
         return True
 
@@ -518,6 +493,7 @@ class ExtensionManager(object):
         See tests/unit/extensions/foxinsocks.py for an example extension
         implementation.
         """
+
         for path in self.path.split(':'):
             if os.path.exists(path):
                 self._load_all_extensions_from_path(path)
@@ -582,10 +558,7 @@ class PluginAwareExtensionManager(ExtensionManager):
 
     def _plugins_support(self, extension):
         alias = extension.get_alias()
-        supports_extension = any((hasattr(plugin,
-                                          "supported_extension_aliases") and
-                                  alias in plugin.supported_extension_aliases)
-                                 for plugin in self.plugins.values())
+        supports_extension = alias in self.get_supported_extension_aliases()
         if not supports_extension:
             LOG.warn(_LW("Extension %s not supported by any of loaded "
                          "plugins"),
@@ -606,15 +579,34 @@ class PluginAwareExtensionManager(ExtensionManager):
     @classmethod
     def get_instance(cls):
         if cls._instance is None:
-            cls._instance = cls(get_extensions_path(),
-                                manager.NeutronManager.get_service_plugins())
+            service_plugins = manager.NeutronManager.get_service_plugins()
+            cls._instance = cls(get_extensions_path(service_plugins),
+                                service_plugins)
         return cls._instance
+
+    def get_supported_extension_aliases(self):
+        """Gets extension aliases supported by all plugins."""
+        aliases = set()
+        for plugin in self.plugins.values():
+            # we also check all classes that the plugins inherit to see if they
+            # directly provide support for an extension
+            for item in [plugin] + plugin.__class__.mro():
+                try:
+                    aliases |= set(
+                        getattr(item, "supported_extension_aliases", []))
+                except TypeError:
+                    # we land here if a class has an @property decorator for
+                    # supported extension aliases. They only work on objects.
+                    pass
+        return aliases
+
+    @classmethod
+    def clear_instance(cls):
+        cls._instance = None
 
     def check_if_plugin_extensions_loaded(self):
         """Check if an extension supported by a plugin has been loaded."""
-        plugin_extensions = set(itertools.chain.from_iterable([
-            getattr(plugin, "supported_extension_aliases", [])
-            for plugin in self.plugins.values()]))
+        plugin_extensions = self.get_supported_extension_aliases()
         missing_aliases = plugin_extensions - set(self.extensions)
         if missing_aliases:
             raise exceptions.ExtensionsNotFound(
@@ -648,7 +640,10 @@ class ResourceExtension(object):
     """Add top level resources to the OpenStack API in Neutron."""
 
     def __init__(self, collection, controller, parent=None, path_prefix="",
-                 collection_actions={}, member_actions={}, attr_map={}):
+                 collection_actions=None, member_actions=None, attr_map=None):
+        collection_actions = collection_actions or {}
+        member_actions = member_actions or {}
+        attr_map = attr_map or {}
         self.collection = collection
         self.controller = controller
         self.parent = parent
@@ -660,12 +655,32 @@ class ResourceExtension(object):
 
 # Returns the extension paths from a config entry and the __path__
 # of neutron.extensions
-def get_extensions_path():
-    paths = ':'.join(neutron.extensions.__path__)
-    if cfg.CONF.api_extensions_path:
-        paths = ':'.join([cfg.CONF.api_extensions_path, paths])
+def get_extensions_path(service_plugins=None):
+    paths = collections.OrderedDict()
 
-    return paths
+    # Add Neutron core extensions
+    paths[neutron.extensions.__path__[0]] = 1
+    if service_plugins:
+        # Add Neutron *-aas extensions
+        for plugin in service_plugins.values():
+            neutron_mod = provider_configuration.NeutronModule(
+                plugin.__module__.split('.')[0])
+            try:
+                paths[neutron_mod.module().extensions.__path__[0]] = 1
+            except AttributeError:
+                # Occurs normally if module has no extensions sub-module
+                pass
+
+    # Add external/other plugins extensions
+    if cfg.CONF.api_extensions_path:
+        for path in cfg.CONF.api_extensions_path.split(":"):
+            paths[path] = 1
+
+    LOG.debug("get_extension_paths = %s", paths)
+
+    # Re-build the extension string
+    path = ':'.join(paths)
+    return path
 
 
 def append_api_extensions_path(paths):

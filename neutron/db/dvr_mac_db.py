@@ -13,29 +13,37 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.db import exception as db_exc
-
+from oslo_config import cfg
+from oslo_db import exception as db_exc
+from oslo_log import helpers as log_helpers
+from oslo_log import log as logging
 import sqlalchemy as sa
+from sqlalchemy.orm import exc
 
-from neutron.common import exceptions as q_exc
-from neutron.common import log
+from neutron.common import exceptions as n_exc
 from neutron.common import utils
 from neutron.db import model_base
 from neutron.extensions import dvr as ext_dvr
 from neutron.extensions import portbindings
 from neutron.i18n import _LE
 from neutron import manager
-from neutron.openstack.common import log as logging
-from oslo.config import cfg
-from sqlalchemy.orm import exc
+
 
 LOG = logging.getLogger(__name__)
+
 
 dvr_mac_address_opts = [
     cfg.StrOpt('dvr_base_mac',
                default="fa:16:3f:00:00:00",
-               help=_('The base mac address used for unique '
-                      'DVR instances by Neutron')),
+               help=_("The base mac address used for unique "
+                      "DVR instances by Neutron. The first 3 octets will "
+                      "remain unchanged. If the 4th octet is not 00, it will "
+                      "also be used. The others will be randomly generated. "
+                      "The 'dvr_base_mac' *must* be different from "
+                      "'base_mac' to avoid mixing them up with MAC's "
+                      "allocated for tenant ports. A 4 octet example would be "
+                      "dvr_base_mac = fa:16:3f:4f:00:00. The default is 3 "
+                      "octet")),
 ]
 cfg.CONF.register_opts(dvr_mac_address_opts)
 
@@ -97,12 +105,6 @@ class DVRDbMixin(ext_dvr.DVRMacAddressPluginBase):
         LOG.error(_LE("MAC generation error after %s attempts"), max_retries)
         raise ext_dvr.MacAddressGenerationFailure(host=host)
 
-    def delete_dvr_mac_address(self, context, host):
-        query = context.session.query(DistributedVirtualRouterMacAddress)
-        (query.
-         filter(DistributedVirtualRouterMacAddress.host == host).
-         delete(synchronize_session=False))
-
     def get_dvr_mac_address_list(self, context):
         with context.session.begin(subtransactions=True):
             return (context.session.
@@ -122,7 +124,7 @@ class DVRDbMixin(ext_dvr.DVRMacAddressPluginBase):
         return {'host': dvr_mac_entry['host'],
                 'mac_address': dvr_mac_entry['mac_address']}
 
-    @log.log
+    @log_helpers.log_method_call
     def get_ports_on_host_by_subnet(self, context, host, subnet):
         """Returns ports of interest, on a given subnet in the input host
 
@@ -153,16 +155,26 @@ class DVRDbMixin(ext_dvr.DVRMacAddressPluginBase):
                    'ports': ports_by_host})
         return ports_by_host
 
-    @log.log
-    def get_subnet_for_dvr(self, context, subnet):
+    @log_helpers.log_method_call
+    def get_subnet_for_dvr(self, context, subnet, fixed_ips=None):
+        if fixed_ips:
+            subnet_data = fixed_ips[0]['subnet_id']
+        else:
+            subnet_data = subnet
         try:
-            subnet_info = self.plugin.get_subnet(context, subnet)
-        except q_exc.SubnetNotFound:
+            subnet_info = self.plugin.get_subnet(
+                context, subnet_data)
+        except n_exc.SubnetNotFound:
             return {}
         else:
             # retrieve the gateway port on this subnet
-            filter = {'fixed_ips': {'subnet_id': [subnet],
-                                    'ip_address': [subnet_info['gateway_ip']]}}
+            if fixed_ips:
+                filter = fixed_ips[0]
+            else:
+                filter = {'fixed_ips': {'subnet_id': [subnet],
+                                        'ip_address':
+                                        [subnet_info['gateway_ip']]}}
+
             internal_gateway_ports = self.plugin.get_ports(
                 context, filters=filter)
             if not internal_gateway_ports:

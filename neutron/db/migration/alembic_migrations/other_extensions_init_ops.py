@@ -37,7 +37,8 @@ def upgrade():
     op.create_table(
         'quotas',
         sa.Column('id', sa.String(length=36), nullable=False),
-        sa.Column('tenant_id', sa.String(length=255), nullable=True),
+        sa.Column('tenant_id', sa.String(length=255), nullable=True,
+                  index=True),
         sa.Column('resource', sa.String(length=255), nullable=True),
         sa.Column('limit', sa.Integer(), nullable=True),
         sa.PrimaryKeyConstraint('id'))
@@ -82,13 +83,3 @@ def upgrade():
         sa.Column('router_id', sa.String(length=36), nullable=False),
         sa.ForeignKeyConstraint(['router_id'], ['routers.id'], ),
         sa.PrimaryKeyConstraint('resource_id', 'resource_type'))
-
-
-def downgrade():
-    op.drop_table('servicerouterbindings')
-    op.drop_table('routerservicetypebindings')
-    op.drop_table('extradhcpopts')
-    op.drop_table('portbindingports')
-    op.drop_table('allowedaddresspairs')
-    op.drop_table('quotas')
-    op.drop_table('providerresourceassociations')

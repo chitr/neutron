@@ -37,32 +37,15 @@ def upgrade():
     op.add_column('ml2_gre_endpoints',
                   sa.Column('host', sa.String(length=255), nullable=True))
     op.create_unique_constraint(
-        name=CONSTRAINT_NAME_GRE,
-        source='ml2_gre_endpoints',
-        local_cols=['host']
+        constraint_name=CONSTRAINT_NAME_GRE,
+        table_name='ml2_gre_endpoints',
+        columns=['host']
     )
 
     op.add_column('ml2_vxlan_endpoints',
                   sa.Column('host', sa.String(length=255), nullable=True))
     op.create_unique_constraint(
-        name=CONSTRAINT_NAME_VXLAN,
-        source='ml2_vxlan_endpoints',
-        local_cols=['host']
-    )
-
-
-def downgrade():
-
-    op.drop_constraint(
-        name=CONSTRAINT_NAME_VXLAN,
+        constraint_name=CONSTRAINT_NAME_VXLAN,
         table_name='ml2_vxlan_endpoints',
-        type_='unique'
+        columns=['host']
     )
-    op.drop_column('ml2_vxlan_endpoints', 'host')
-
-    op.drop_constraint(
-        name=CONSTRAINT_NAME_GRE,
-        table_name='ml2_gre_endpoints',
-        type_='unique'
-    )
-    op.drop_column('ml2_gre_endpoints', 'host')

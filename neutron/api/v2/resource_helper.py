@@ -13,25 +13,34 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from neutron.api import extensions
 from neutron.api.v2 import base
 from neutron import manager
 from neutron.plugins.common import constants
-from neutron import quota
+from neutron.quota import resource_registry
+
+LOG = logging.getLogger(__name__)
 
 
 def build_plural_mappings(special_mappings, resource_map):
     """Create plural to singular mapping for all resources.
 
-    Allows for special mappings to be provided, like policies -> policy.
+    Allows for special mappings to be provided, for particular cases..
     Otherwise, will strip off the last character for normal mappings, like
-    routers -> router.
+    routers -> router, unless the plural name ends with 'ies', in which
+    case the singular form will end with a 'y' (e.g.: policy/policies)
     """
     plural_mappings = {}
     for plural in resource_map:
-        singular = special_mappings.get(plural, plural[:-1])
+        singular = special_mappings.get(plural)
+        if not singular:
+            if plural.endswith('ies'):
+                singular = "%sy" % plural[:-3]
+            else:
+                singular = plural[:-1]
         plural_mappings[plural] = singular
     return plural_mappings
 
@@ -68,13 +77,16 @@ def build_resource_info(plural_mappings, resource_map, which_service,
         plugin = manager.NeutronManager.get_service_plugins()[which_service]
     else:
         plugin = manager.NeutronManager.get_plugin()
+    path_prefix = getattr(plugin, "path_prefix", "")
+    LOG.debug('Service %(service)s assigned prefix: %(prefix)s'
+              % {'service': which_service, 'prefix': path_prefix})
     for collection_name in resource_map:
         resource_name = plural_mappings[collection_name]
         params = resource_map.get(collection_name, {})
         if translate_name:
             collection_name = collection_name.replace('_', '-')
         if register_quota:
-            quota.QUOTAS.register_resource_by_name(resource_name)
+            resource_registry.register_resource_by_name(resource_name)
         member_actions = action_map.get(resource_name, {})
         controller = base.create_resource(
             collection_name, resource_name, plugin, params,
@@ -85,7 +97,7 @@ def build_resource_info(plural_mappings, resource_map, which_service,
         resource = extensions.ResourceExtension(
             collection_name,
             controller,
-            path_prefix=constants.COMMON_PREFIXES[which_service],
+            path_prefix=path_prefix,
             member_actions=member_actions,
             attr_map=params)
         resources.append(resource)

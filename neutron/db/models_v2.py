@@ -16,31 +16,17 @@
 import sqlalchemy as sa
 from sqlalchemy import orm
 
+from neutron.api.v2 import attributes as attr
 from neutron.common import constants
 from neutron.db import model_base
-from neutron.openstack.common import uuidutils
+from neutron.db import rbac_db_models
 
 
-class HasTenant(object):
-    """Tenant mixin, add to subclasses that have a tenant."""
-
-    # NOTE(jkoelker) tenant_id is just a free form string ;(
-    tenant_id = sa.Column(sa.String(255))
-
-
-class HasId(object):
-    """id mixin, add to subclasses that have an id."""
-
-    id = sa.Column(sa.String(36),
-                   primary_key=True,
-                   default=uuidutils.generate_uuid)
-
-
-class HasStatusDescription(object):
-    """Status with description mixin."""
-
-    status = sa.Column(sa.String(16), nullable=False)
-    status_description = sa.Column(sa.String(255))
+# NOTE(kevinbenton): these are here for external projects that expect them
+# to be found in this module.
+HasTenant = model_base.HasTenant
+HasId = model_base.HasId
+HasStatusDescription = model_base.HasStatusDescription
 
 
 class IPAvailabilityRange(model_base.BASEV2):
@@ -69,7 +55,9 @@ class IPAvailabilityRange(model_base.BASEV2):
             name='uniq_ipavailabilityranges0first_ip0allocation_pool_id'),
         sa.UniqueConstraint(
             last_ip, allocation_pool_id,
-            name='uniq_ipavailabilityranges0last_ip0allocation_pool_id'))
+            name='uniq_ipavailabilityranges0last_ip0allocation_pool_id'),
+        model_base.BASEV2.__table_args__
+    )
 
     def __repr__(self):
         return "%s - %s" % (self.first_ip, self.last_ip)
@@ -85,7 +73,7 @@ class IPAllocationPool(model_base.BASEV2, HasId):
     last_ip = sa.Column(sa.String(64), nullable=False)
     available_ranges = orm.relationship(IPAvailabilityRange,
                                         backref='ipallocationpool',
-                                        lazy="joined",
+                                        lazy="select",
                                         cascade='all, delete-orphan')
 
     def __repr__(self):
@@ -126,16 +114,23 @@ class SubnetRoute(model_base.BASEV2, Route):
 class Port(model_base.BASEV2, HasId, HasTenant):
     """Represents a port on a Neutron v2 network."""
 
-    name = sa.Column(sa.String(255))
+    name = sa.Column(sa.String(attr.NAME_MAX_LEN))
     network_id = sa.Column(sa.String(36), sa.ForeignKey("networks.id"),
                            nullable=False)
-    fixed_ips = orm.relationship(IPAllocation, backref='ports', lazy='joined')
+    fixed_ips = orm.relationship(IPAllocation, backref='port', lazy='joined',
+                                 passive_deletes='all')
     mac_address = sa.Column(sa.String(32), nullable=False)
     admin_state_up = sa.Column(sa.Boolean(), nullable=False)
     status = sa.Column(sa.String(16), nullable=False)
-    device_id = sa.Column(sa.String(255), nullable=False)
-    device_owner = sa.Column(sa.String(255), nullable=False)
+    device_id = sa.Column(sa.String(attr.DEVICE_ID_MAX_LEN), nullable=False)
+    device_owner = sa.Column(sa.String(attr.DEVICE_OWNER_MAX_LEN),
+                             nullable=False)
+    dns_name = sa.Column(sa.String(255), nullable=True)
     __table_args__ = (
+        sa.Index(
+            'ix_ports_network_id_mac_address', 'network_id', 'mac_address'),
+        sa.Index(
+            'ix_ports_network_id_device_owner', 'network_id', 'device_owner'),
         sa.UniqueConstraint(
             network_id, mac_address,
             name='uniq_ports0network_id0mac_address'),
@@ -144,7 +139,8 @@ class Port(model_base.BASEV2, HasId, HasTenant):
 
     def __init__(self, id=None, tenant_id=None, name=None, network_id=None,
                  mac_address=None, admin_state_up=None, status=None,
-                 device_id=None, device_owner=None, fixed_ips=None):
+                 device_id=None, device_owner=None, fixed_ips=None,
+                 dns_name=None):
         self.id = id
         self.tenant_id = tenant_id
         self.name = name
@@ -153,6 +149,7 @@ class Port(model_base.BASEV2, HasId, HasTenant):
         self.admin_state_up = admin_state_up
         self.device_owner = device_owner
         self.device_id = device_id
+        self.dns_name = dns_name
         # Since this is a relationship only set it if one is passed in.
         if fixed_ips:
             self.fixed_ips = fixed_ips
@@ -169,6 +166,7 @@ class DNSNameServer(model_base.BASEV2):
                           sa.ForeignKey('subnets.id',
                                         ondelete="CASCADE"),
                           primary_key=True)
+    order = sa.Column(sa.Integer, nullable=False, server_default='0')
 
 
 class Subnet(model_base.BASEV2, HasId, HasTenant):
@@ -178,8 +176,9 @@ class Subnet(model_base.BASEV2, HasId, HasTenant):
     are used for the IP allocation.
     """
 
-    name = sa.Column(sa.String(255))
+    name = sa.Column(sa.String(attr.NAME_MAX_LEN))
     network_id = sa.Column(sa.String(36), sa.ForeignKey('networks.id'))
+    subnetpool_id = sa.Column(sa.String(36), index=True)
     ip_version = sa.Column(sa.Integer, nullable=False)
     cidr = sa.Column(sa.String(64), nullable=False)
     gateway_ip = sa.Column(sa.String(64))
@@ -191,12 +190,12 @@ class Subnet(model_base.BASEV2, HasId, HasTenant):
     dns_nameservers = orm.relationship(DNSNameServer,
                                        backref='subnet',
                                        cascade='all, delete, delete-orphan',
+                                       order_by=DNSNameServer.order,
                                        lazy='joined')
     routes = orm.relationship(SubnetRoute,
                               backref='subnet',
                               cascade='all, delete, delete-orphan',
                               lazy='joined')
-    shared = sa.Column(sa.Boolean)
     ipv6_ra_mode = sa.Column(sa.Enum(constants.IPV6_SLAAC,
                                      constants.DHCPV6_STATEFUL,
                                      constants.DHCPV6_STATELESS,
@@ -205,15 +204,60 @@ class Subnet(model_base.BASEV2, HasId, HasTenant):
                                   constants.DHCPV6_STATEFUL,
                                   constants.DHCPV6_STATELESS,
                                   name='ipv6_address_modes'), nullable=True)
+    # subnets don't have their own rbac_entries, they just inherit from
+    # the network rbac entries
+    rbac_entries = orm.relationship(
+        rbac_db_models.NetworkRBAC, lazy='joined',
+        foreign_keys='Subnet.network_id',
+        primaryjoin='Subnet.network_id==NetworkRBAC.object_id')
+
+
+class SubnetPoolPrefix(model_base.BASEV2):
+    """Represents a neutron subnet pool prefix
+    """
+
+    __tablename__ = 'subnetpoolprefixes'
+
+    cidr = sa.Column(sa.String(64), nullable=False, primary_key=True)
+    subnetpool_id = sa.Column(sa.String(36),
+                              sa.ForeignKey('subnetpools.id',
+                                            ondelete='CASCADE'),
+                              nullable=False,
+                              primary_key=True)
+
+
+class SubnetPool(model_base.BASEV2, HasId, HasTenant):
+    """Represents a neutron subnet pool.
+    """
+
+    name = sa.Column(sa.String(255))
+    ip_version = sa.Column(sa.Integer, nullable=False)
+    default_prefixlen = sa.Column(sa.Integer, nullable=False)
+    min_prefixlen = sa.Column(sa.Integer, nullable=False)
+    max_prefixlen = sa.Column(sa.Integer, nullable=False)
+    shared = sa.Column(sa.Boolean, nullable=False)
+    is_default = sa.Column(sa.Boolean, nullable=False)
+    default_quota = sa.Column(sa.Integer, nullable=True)
+    hash = sa.Column(sa.String(36), nullable=False, server_default='')
+    address_scope_id = sa.Column(sa.String(36), nullable=True)
+    prefixes = orm.relationship(SubnetPoolPrefix,
+                                backref='subnetpools',
+                                cascade='all, delete, delete-orphan',
+                                lazy='joined')
 
 
 class Network(model_base.BASEV2, HasId, HasTenant):
     """Represents a v2 neutron network."""
 
-    name = sa.Column(sa.String(255))
+    name = sa.Column(sa.String(attr.NAME_MAX_LEN))
     ports = orm.relationship(Port, backref='networks')
-    subnets = orm.relationship(Subnet, backref='networks',
-                               lazy="joined")
+    subnets = orm.relationship(
+        Subnet, backref=orm.backref('networks', lazy='joined'),
+        lazy="joined")
     status = sa.Column(sa.String(16))
     admin_state_up = sa.Column(sa.Boolean)
-    shared = sa.Column(sa.Boolean)
+    mtu = sa.Column(sa.Integer, nullable=True)
+    vlan_transparent = sa.Column(sa.Boolean, nullable=True)
+    rbac_entries = orm.relationship(rbac_db_models.NetworkRBAC,
+                                    backref='network', lazy='joined',
+                                    cascade='all, delete, delete-orphan')

@@ -13,17 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
-from oslo.db import exception as db_exc
-from six import moves
+from oslo_config import cfg
+from oslo_log import log
 import sqlalchemy as sa
 from sqlalchemy import sql
 
 from neutron.common import exceptions as n_exc
-from neutron.db import api as db_api
 from neutron.db import model_base
-from neutron.i18n import _LE, _LW
-from neutron.openstack.common import log
+from neutron.i18n import _LE
 from neutron.plugins.common import constants as p_const
 from neutron.plugins.ml2.drivers import type_tunnel
 
@@ -47,7 +44,7 @@ class GreAllocation(model_base.BASEV2):
     gre_id = sa.Column(sa.Integer, nullable=False, primary_key=True,
                        autoincrement=False)
     allocated = sa.Column(sa.Boolean, nullable=False, default=False,
-                          server_default=sql.false())
+                          server_default=sql.false(), index=True)
 
 
 class GreEndpoints(model_base.BASEV2):
@@ -57,6 +54,7 @@ class GreEndpoints(model_base.BASEV2):
     __table_args__ = (
         sa.UniqueConstraint('host',
                             name='unique_ml2_gre_endpoints0host'),
+        model_base.BASEV2.__table_args__
     )
     ip_address = sa.Column(sa.String(64), primary_key=True)
     host = sa.Column(sa.String(255), nullable=True)
@@ -65,10 +63,11 @@ class GreEndpoints(model_base.BASEV2):
         return "<GreTunnelEndpoint(%s)>" % self.ip_address
 
 
-class GreTypeDriver(type_tunnel.TunnelTypeDriver):
+class GreTypeDriver(type_tunnel.EndpointTunnelTypeDriver):
 
     def __init__(self):
-        super(GreTypeDriver, self).__init__(GreAllocation)
+        super(GreTypeDriver, self).__init__(
+            GreAllocation, GreEndpoints)
 
     def get_type(self):
         return p_const.TYPE_GRE
@@ -81,77 +80,16 @@ class GreTypeDriver(type_tunnel.TunnelTypeDriver):
                               "Service terminated!"))
             raise SystemExit()
 
-    def sync_allocations(self):
-
-        # determine current configured allocatable gres
-        gre_ids = set()
-        for gre_id_range in self.tunnel_ranges:
-            tun_min, tun_max = gre_id_range
-            if tun_max + 1 - tun_min > 1000000:
-                LOG.error(_LE("Skipping unreasonable gre ID range "
-                              "%(tun_min)s:%(tun_max)s"),
-                          {'tun_min': tun_min, 'tun_max': tun_max})
-            else:
-                gre_ids |= set(moves.xrange(tun_min, tun_max + 1))
-
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
-            # remove from table unallocated tunnels not currently allocatable
-            allocs = (session.query(GreAllocation).all())
-            for alloc in allocs:
-                try:
-                    # see if tunnel is allocatable
-                    gre_ids.remove(alloc.gre_id)
-                except KeyError:
-                    # it's not allocatable, so check if its allocated
-                    if not alloc.allocated:
-                        # it's not, so remove it from table
-                        LOG.debug("Removing tunnel %s from pool", alloc.gre_id)
-                        session.delete(alloc)
-
-            # add missing allocatable tunnels to table
-            for gre_id in sorted(gre_ids):
-                alloc = GreAllocation(gre_id=gre_id)
-                session.add(alloc)
-
     def get_endpoints(self):
         """Get every gre endpoints from database."""
-
-        LOG.debug("get_gre_endpoints() called")
-        session = db_api.get_session()
-
-        gre_endpoints = session.query(GreEndpoints)
+        gre_endpoints = self._get_endpoints()
         return [{'ip_address': gre_endpoint.ip_address,
                  'host': gre_endpoint.host}
                 for gre_endpoint in gre_endpoints]
 
-    def get_endpoint_by_host(self, host):
-        LOG.debug("get_endpoint_by_host() called for host %s", host)
-        session = db_api.get_session()
-        return (session.query(GreEndpoints).
-                filter_by(host=host).first())
-
-    def get_endpoint_by_ip(self, ip):
-        LOG.debug("get_endpoint_by_ip() called for ip %s", ip)
-        session = db_api.get_session()
-        return (session.query(GreEndpoints).
-                filter_by(ip_address=ip).first())
-
     def add_endpoint(self, ip, host):
-        LOG.debug("add_gre_endpoint() called for ip %s", ip)
-        session = db_api.get_session()
-        try:
-            gre_endpoint = GreEndpoints(ip_address=ip, host=host)
-            gre_endpoint.save(session)
-        except db_exc.DBDuplicateEntry:
-            gre_endpoint = (session.query(GreEndpoints).
-                            filter_by(ip_address=ip).one())
-            LOG.warning(_LW("Gre endpoint with ip %s already exists"), ip)
-        return gre_endpoint
+        return self._add_endpoint(ip, host)
 
-    def delete_endpoint(self, ip):
-        LOG.debug("delete_gre_endpoint() called for ip %s", ip)
-        session = db_api.get_session()
-
-        with session.begin(subtransactions=True):
-            session.query(GreEndpoints).filter_by(ip_address=ip).delete()
+    def get_mtu(self, physical_network=None):
+        mtu = super(GreTypeDriver, self).get_mtu(physical_network)
+        return mtu - p_const.GRE_ENCAP_OVERHEAD if mtu else 0

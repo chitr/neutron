@@ -13,8 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_utils import importutils
 import webob
 
 from neutron.api import extensions
@@ -25,13 +25,14 @@ from neutron.common import constants as const
 from neutron.common import exceptions as n_exc
 from neutron import manager
 from neutron import quota
+from neutron.quota import resource_registry
 from neutron import wsgi
 
 
 RESOURCE_NAME = 'quota'
 RESOURCE_COLLECTION = RESOURCE_NAME + "s"
 QUOTAS = quota.QUOTAS
-DB_QUOTA_DRIVER = 'neutron.db.quota_db.DbQuotaDriver'
+DB_QUOTA_DRIVER = 'neutron.db.quota.driver.DbQuotaDriver'
 EXTENDED_ATTRIBUTES_2_0 = {
     RESOURCE_COLLECTION: {}
 }
@@ -48,7 +49,7 @@ class QuotaSetsController(wsgi.Controller):
         self._update_extended_attributes = True
 
     def _update_attributes(self):
-        for quota_resource in QUOTAS.resources.iterkeys():
+        for quota_resource in resource_registry.get_all_resources().keys():
             attr_dict = EXTENDED_ATTRIBUTES_2_0[RESOURCE_COLLECTION]
             attr_dict[quota_resource] = {
                 'allow_post': False,
@@ -60,7 +61,9 @@ class QuotaSetsController(wsgi.Controller):
 
     def _get_quotas(self, request, tenant_id):
         return self._driver.get_tenant_quotas(
-            request.context, QUOTAS.resources, tenant_id)
+            request.context,
+            resource_registry.get_all_resources(),
+            tenant_id)
 
     def create(self, request, body=None):
         msg = _('POST requests are not supported on this resource.')
@@ -70,7 +73,8 @@ class QuotaSetsController(wsgi.Controller):
         context = request.context
         self._check_admin(context)
         return {self._resource_name + "s":
-                self._driver.get_all_quotas(context, QUOTAS.resources)}
+                self._driver.get_all_quotas(
+                    context, resource_registry.get_all_resources())}
 
     def tenant(self, request):
         """Retrieve the tenant info in context."""
@@ -124,10 +128,6 @@ class Quotasv2(extensions.ExtensionDescriptor):
         if cfg.CONF.QUOTAS.quota_driver == DB_QUOTA_DRIVER:
             description += ' per tenant'
         return description
-
-    @classmethod
-    def get_namespace(cls):
-        return "http://docs.openstack.org/network/ext/quotas-sets/api/v2.0"
 
     @classmethod
     def get_updated(cls):

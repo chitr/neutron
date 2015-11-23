@@ -14,14 +14,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.messaging import serializer as om_serializer
+from debtcollector import removals
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging
+from oslo_messaging import serializer as om_serializer
+from oslo_service import service
 
 from neutron.common import exceptions
 from neutron import context
-from neutron.openstack.common import log as logging
-from neutron.openstack.common import service
 
 
 LOG = logging.getLogger(__name__)
@@ -47,15 +48,21 @@ TRANSPORT_ALIASES = {
     'neutron.rpc.impl_zmq': 'zmq',
 }
 
+# NOTE(salv-orlando): I am afraid this is a global variable. While not ideal,
+# they're however widely used throughout the code base. It should be set to
+# true if the RPC server is not running in the current process space. This
+# will prevent get_connection from creating connections to the AMQP server
+RPC_DISABLED = False
+
 
 def init(conf):
     global TRANSPORT, NOTIFIER
     exmods = get_allowed_exmods()
-    TRANSPORT = messaging.get_transport(conf,
-                                        allowed_remote_exmods=exmods,
-                                        aliases=TRANSPORT_ALIASES)
+    TRANSPORT = oslo_messaging.get_transport(conf,
+                                             allowed_remote_exmods=exmods,
+                                             aliases=TRANSPORT_ALIASES)
     serializer = RequestContextSerializer()
-    NOTIFIER = messaging.Notifier(TRANSPORT, serializer=serializer)
+    NOTIFIER = oslo_messaging.Notifier(TRANSPORT, serializer=serializer)
 
 
 def cleanup():
@@ -81,17 +88,17 @@ def get_allowed_exmods():
 def get_client(target, version_cap=None, serializer=None):
     assert TRANSPORT is not None
     serializer = RequestContextSerializer(serializer)
-    return messaging.RPCClient(TRANSPORT,
-                               target,
-                               version_cap=version_cap,
-                               serializer=serializer)
+    return oslo_messaging.RPCClient(TRANSPORT,
+                                    target,
+                                    version_cap=version_cap,
+                                    serializer=serializer)
 
 
 def get_server(target, endpoints, serializer=None):
     assert TRANSPORT is not None
     serializer = RequestContextSerializer(serializer)
-    return messaging.get_rpc_server(TRANSPORT, target, endpoints,
-                                    'eventlet', serializer)
+    return oslo_messaging.get_rpc_server(TRANSPORT, target, endpoints,
+                                         'eventlet', serializer)
 
 
 def get_notifier(service=None, host=None, publisher_id=None):
@@ -130,8 +137,7 @@ class RequestContextSerializer(om_serializer.Serializer):
         tenant_id = rpc_ctxt_dict.pop('tenant_id', None)
         if not tenant_id:
             tenant_id = rpc_ctxt_dict.pop('project_id', None)
-        return context.Context(user_id, tenant_id,
-                               load_admin_roles=False, **rpc_ctxt_dict)
+        return context.Context(user_id, tenant_id, **rpc_ctxt_dict)
 
 
 class Service(service.Service):
@@ -152,19 +158,13 @@ class Service(service.Service):
     def start(self):
         super(Service, self).start()
 
-        self.conn = create_connection(new=True)
+        self.conn = create_connection()
         LOG.debug("Creating Consumer connection for Service %s",
                   self.topic)
 
         endpoints = [self.manager]
 
-        # Share this same connection for these Consumers
-        self.conn.create_consumer(self.topic, endpoints, fanout=False)
-
-        node_topic = '%s.%s' % (self.topic, self.host)
-        self.conn.create_consumer(node_topic, endpoints, fanout=False)
-
-        self.conn.create_consumer(self.topic, endpoints, fanout=True)
+        self.conn.create_consumer(self.topic, endpoints)
 
         # Hook to allow the manager to do other initializations after
         # the rpc connection is created.
@@ -191,7 +191,7 @@ class Connection(object):
         self.servers = []
 
     def create_consumer(self, topic, endpoints, fanout=False):
-        target = messaging.Target(
+        target = oslo_messaging.Target(
             topic=topic, server=cfg.CONF.host, fanout=fanout)
         server = get_server(target, endpoints)
         self.servers.append(server)
@@ -201,7 +201,33 @@ class Connection(object):
             server.start()
         return self.servers
 
+    def close(self):
+        for server in self.servers:
+            server.stop()
+        for server in self.servers:
+            server.wait()
+
+
+class VoidConnection(object):
+
+    def create_consumer(self, topic, endpoints, fanout=False):
+        pass
+
+    def consume_in_threads(self):
+        pass
+
+    def close(self):
+        pass
+
 
 # functions
+@removals.removed_kwarg('new')
 def create_connection(new=True):
+    # NOTE(salv-orlando): This is a clever interpretation of the factory design
+    # patter aimed at preventing plugins from initializing RPC servers upon
+    # initialization when they are running in the REST over HTTP API server.
+    # The educated reader will perfectly be able that this a fairly dirty hack
+    # to avoid having to change the initialization process of every plugin.
+    if RPC_DISABLED:
+        return VoidConnection()
     return Connection()

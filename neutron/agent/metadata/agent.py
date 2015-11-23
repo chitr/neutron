@@ -14,18 +14,18 @@
 
 import hashlib
 import hmac
-import os
-import socket
 
-import eventlet
 import httplib2
-from neutronclient.v2_0 import client
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import excutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging
+from oslo_service import loopingcall
+import six
 import six.moves.urllib.parse as urlparse
 import webob
 
+from neutron.agent.linux import utils as agent_utils
+from neutron.agent.metadata import config
 from neutron.agent import rpc as agent_rpc
 from neutron.common import constants as n_const
 from neutron.common import rpc as n_rpc
@@ -34,11 +34,14 @@ from neutron.common import utils
 from neutron import context
 from neutron.i18n import _LE, _LW
 from neutron.openstack.common.cache import cache
-from neutron.openstack.common import log as logging
-from neutron.openstack.common import loopingcall
-from neutron import wsgi
 
 LOG = logging.getLogger(__name__)
+
+MODE_MAP = {
+    config.USER_MODE: 0o644,
+    config.GROUP_MODE: 0o664,
+    config.ALL_MODE: 0o666,
+}
 
 
 class MetadataPluginAPI(object):
@@ -56,9 +59,10 @@ class MetadataPluginAPI(object):
     """
 
     def __init__(self, topic):
-        target = messaging.Target(topic=topic,
-                                  namespace=n_const.RPC_NAMESPACE_METADATA,
-                                  version='1.0')
+        target = oslo_messaging.Target(
+            topic=topic,
+            namespace=n_const.RPC_NAMESPACE_METADATA,
+            version='1.0')
         self.client = n_rpc.get_client(target)
 
     def get_ports(self, context, filters):
@@ -70,7 +74,6 @@ class MetadataProxyHandler(object):
 
     def __init__(self, conf):
         self.conf = conf
-        self.auth_info = {}
         if self.conf.cache_url:
             self._cache = cache.get_cache(self.conf.cache_url)
         else:
@@ -78,24 +81,6 @@ class MetadataProxyHandler(object):
 
         self.plugin_rpc = MetadataPluginAPI(topics.PLUGIN)
         self.context = context.get_admin_context_without_session()
-        # Use RPC by default
-        self.use_rpc = True
-
-    def _get_neutron_client(self):
-        qclient = client.Client(
-            username=self.conf.admin_user,
-            password=self.conf.admin_password,
-            tenant_name=self.conf.admin_tenant_name,
-            auth_url=self.conf.auth_url,
-            auth_strategy=self.conf.auth_strategy,
-            region_name=self.conf.auth_region,
-            token=self.auth_info.get('auth_token'),
-            insecure=self.conf.auth_insecure,
-            ca_cert=self.conf.auth_ca_cert,
-            endpoint_url=self.auth_info.get('endpoint_url'),
-            endpoint_type=self.conf.endpoint_type
-        )
-        return qclient
 
     @webob.dec.wsgify(RequestClass=webob.Request)
     def __call__(self, req):
@@ -112,23 +97,14 @@ class MetadataProxyHandler(object):
             LOG.exception(_LE("Unexpected error."))
             msg = _('An unknown error has occurred. '
                     'Please try your request again.')
-            return webob.exc.HTTPInternalServerError(explanation=unicode(msg))
+            explanation = six.text_type(msg)
+            return webob.exc.HTTPInternalServerError(explanation=explanation)
 
     def _get_ports_from_server(self, router_id=None, ip_address=None,
                                networks=None):
-        """Either get ports from server by RPC or fallback to neutron client"""
+        """Get ports from server."""
         filters = self._get_port_filters(router_id, ip_address, networks)
-        if self.use_rpc:
-            try:
-                return self.plugin_rpc.get_ports(self.context, filters)
-            except (messaging.MessagingException, AttributeError):
-                # TODO(obondarev): remove fallback once RPC is proven
-                # to work fine with metadata agent (K or L release at most)
-                LOG.warning(_LW('Server does not support metadata RPC, '
-                                'fallback to using neutron client'))
-                self.use_rpc = False
-
-        return self._get_ports_using_client(filters)
+        return self.plugin_rpc.get_ports(self.context, filters)
 
     def _get_port_filters(self, router_id=None, ip_address=None,
                           networks=None):
@@ -160,19 +136,6 @@ class MetadataProxyHandler(object):
         """
         return self._get_ports_from_server(networks=networks,
                                            ip_address=remote_address)
-
-    def _get_ports_using_client(self, filters):
-        # reformat filters for neutron client
-        if 'device_id' in filters:
-            filters['device_id'] = filters['device_id'][0]
-        if 'fixed_ips' in filters:
-            filters['fixed_ips'] = [
-                'ip_address=%s' % filters['fixed_ips']['ip_address'][0]]
-
-        client = self._get_neutron_client()
-        ports = client.list_ports(**filters)
-        self.auth_info = client.get_auth_info()
-        return ports['ports']
 
     def _get_ports(self, remote_address, network_id=None, router_id=None):
         """Search for all ports that contain passed ip address and belongs to
@@ -253,77 +216,31 @@ class MetadataProxyHandler(object):
                 'Remote metadata server experienced an internal server error.'
             )
             LOG.warn(msg)
-            return webob.exc.HTTPInternalServerError(explanation=unicode(msg))
+            explanation = six.text_type(msg)
+            return webob.exc.HTTPInternalServerError(explanation=explanation)
         else:
             raise Exception(_('Unexpected response code: %s') % resp.status)
 
     def _sign_instance_id(self, instance_id):
-        return hmac.new(self.conf.metadata_proxy_shared_secret,
-                        instance_id,
-                        hashlib.sha256).hexdigest()
-
-
-class UnixDomainHttpProtocol(eventlet.wsgi.HttpProtocol):
-    def __init__(self, request, client_address, server):
-        if client_address == '':
-            client_address = ('<local>', 0)
-        # base class is old-style, so super does not work properly
-        eventlet.wsgi.HttpProtocol.__init__(self, request, client_address,
-                                            server)
-
-
-class WorkerService(wsgi.WorkerService):
-    def start(self):
-        self._server = self._service.pool.spawn(self._service._run,
-                                                self._application,
-                                                self._service._socket)
-
-
-class UnixDomainWSGIServer(wsgi.Server):
-    def __init__(self, name):
-        self._socket = None
-        self._launcher = None
-        self._server = None
-        super(UnixDomainWSGIServer, self).__init__(name)
-
-    def start(self, application, file_socket, workers, backlog):
-        self._socket = eventlet.listen(file_socket,
-                                       family=socket.AF_UNIX,
-                                       backlog=backlog)
-
-        self._launch(application, workers=workers)
-
-    def _run(self, application, socket):
-        """Start a WSGI service in a new green thread."""
-        logger = logging.getLogger('eventlet.wsgi.server')
-        eventlet.wsgi.server(socket,
-                             application,
-                             custom_pool=self.pool,
-                             protocol=UnixDomainHttpProtocol,
-                             log=logging.WritableLogger(logger))
+        secret = self.conf.metadata_proxy_shared_secret
+        if isinstance(secret, six.text_type):
+            secret = secret.encode('utf-8')
+        if isinstance(instance_id, six.text_type):
+            instance_id = instance_id.encode('utf-8')
+        return hmac.new(secret, instance_id, hashlib.sha256).hexdigest()
 
 
 class UnixDomainMetadataProxy(object):
 
     def __init__(self, conf):
         self.conf = conf
-
-        dirname = os.path.dirname(cfg.CONF.metadata_proxy_socket)
-        if os.path.isdir(dirname):
-            try:
-                os.unlink(cfg.CONF.metadata_proxy_socket)
-            except OSError:
-                with excutils.save_and_reraise_exception() as ctxt:
-                    if not os.path.exists(cfg.CONF.metadata_proxy_socket):
-                        ctxt.reraise = False
-        else:
-            os.makedirs(dirname, 0o755)
-
+        agent_utils.ensure_directory_exists_without_file(
+            cfg.CONF.metadata_proxy_socket)
         self._init_state_reporting()
 
     def _init_state_reporting(self):
         self.context = context.get_admin_context_without_session()
-        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.PLUGIN)
+        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.REPORTS)
         self.agent_state = {
             'binary': 'neutron-metadata-agent',
             'host': cfg.CONF.host,
@@ -332,6 +249,7 @@ class UnixDomainMetadataProxy(object):
                 'metadata_proxy_socket': cfg.CONF.metadata_proxy_socket,
                 'nova_metadata_ip': cfg.CONF.nova_metadata_ip,
                 'nova_metadata_port': cfg.CONF.nova_metadata_port,
+                'log_agent_heartbeats': cfg.CONF.AGENT.log_agent_heartbeats,
             },
             'start_flag': True,
             'agent_type': n_const.AGENT_TYPE_METADATA}
@@ -358,10 +276,29 @@ class UnixDomainMetadataProxy(object):
             return
         self.agent_state.pop('start_flag', None)
 
+    def _get_socket_mode(self):
+        mode = self.conf.metadata_proxy_socket_mode
+        if mode == config.DEDUCE_MODE:
+            user = self.conf.metadata_proxy_user
+            if (not user or user == '0' or user == 'root'
+                    or agent_utils.is_effective_user(user)):
+                # user is agent effective user or root => USER_MODE
+                mode = config.USER_MODE
+            else:
+                group = self.conf.metadata_proxy_group
+                if not group or agent_utils.is_effective_group(group):
+                    # group is agent effective group => GROUP_MODE
+                    mode = config.GROUP_MODE
+                else:
+                    # otherwise => ALL_MODE
+                    mode = config.ALL_MODE
+        return MODE_MAP[mode]
+
     def run(self):
-        server = UnixDomainWSGIServer('neutron-metadata-agent')
+        server = agent_utils.UnixDomainWSGIServer('neutron-metadata-agent')
         server.start(MetadataProxyHandler(self.conf),
                      self.conf.metadata_proxy_socket,
                      workers=self.conf.metadata_workers,
-                     backlog=self.conf.metadata_backlog)
+                     backlog=self.conf.metadata_backlog,
+                     mode=self._get_socket_mode())
         server.wait()
